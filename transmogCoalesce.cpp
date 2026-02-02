@@ -540,7 +540,16 @@ void __fastcall transmogCoalesce_hook(void* conn, void* edx, uint32_t ts, CDataS
     // Durability capture happened inline during parse - check if we should drop
     if (p.durCaptured) return;
 
-    // Detect transmog pattern in VISIBLE_ITEM changes
+    // Two-pass approach: first categorize all changes, then decide what to do
+    bool hasRealUnequip = false;      // INV_SLOT cleared = real gear removal
+    bool hasTransmogClear = false;    // VISIBLE_ITEM cleared without INV_SLOT = transmog pattern
+    bool hasOtherPlayerClear = false; // Other player visible item cleared
+    bool hasBrokenItem = false;       // Restore with dur=0 needs visual update
+    bool hasRestore = false;          // Any restore we can coalesce
+    bool needInvAlert = false;        // Need to call UpdateInventoryAlertStates
+    bool hashTableFull = false;       // Other player hash table congested
+
+    // First pass: categorize all changes and update pending state
     for (int idx = 0; idx < p.visibleCount; idx++) {
         auto& c = p.visible[idx];
         bool isLocal = (c.guid == local);
@@ -548,21 +557,25 @@ void __fastcall transmogCoalesce_hook(void* conn, void* edx, uint32_t ts, CDataS
         if (c.value == 0) {
             // CLEAR
             if (isLocal) {
-                if (p.invClear[c.slot]) continue;
-                // Transmog pattern - set pending for durability capture (no packet storage needed)
+                if (p.invClear[c.slot]) {
+                    hasRealUnequip = true;
+                    continue;
+                }
+                // Transmog pattern - set pending for durability capture
                 if (!g_pending[c.slot].active) g_localPendingCount++;
                 g_pending[c.slot] = {now, 0, false, true};
-                return;
-            }
-            // Other player - track for coalescing (no packet storage needed)
-            int otherIdx = findOtherPendingSlot(c.guid, c.slot);
-            if (otherIdx >= 0) {
-                if (!g_otherPending[otherIdx].active) g_otherPendingCount++;
-                g_otherPending[otherIdx] = {c.guid, c.slot, now, true};
+                hasTransmogClear = true;
             } else {
-                break;  // Hash table too congested, pass packet through
+                // Other player - track for coalescing
+                int otherIdx = findOtherPendingSlot(c.guid, c.slot);
+                if (otherIdx >= 0) {
+                    if (!g_otherPending[otherIdx].active) g_otherPendingCount++;
+                    g_otherPending[otherIdx] = {c.guid, c.slot, now, true};
+                    hasOtherPlayerClear = true;
+                } else {
+                    hashTableFull = true;
+                }
             }
-            return;
         } else {
             // RESTORE
             if (isLocal && g_pending[c.slot].active) {
@@ -574,8 +587,8 @@ void __fastcall transmogCoalesce_hook(void* conn, void* edx, uint32_t ts, CDataS
                             // Broken item (dur=0) - need visual update
                             g_pending[c.slot].active = false;
                             g_localPendingCount--;
-                            p_Original(conn, ts, msg);
-                            return;
+                            hasBrokenItem = true;
+                            continue;
                         }
                         // Write durability directly to item descriptor
                         uint32_t obj = getCachedEquippedItemObject(c.slot);
@@ -586,32 +599,48 @@ void __fastcall transmogCoalesce_hook(void* conn, void* edx, uint32_t ts, CDataS
                         }
                         g_pending[c.slot].active = false;
                         g_localPendingCount--;
-                        p_UpdateInvAlerts();
-                        return;
+                        needInvAlert = true;
+                        hasRestore = true;
                     } else {
                         // No durability captured - item was already at full durability
                         // Coalesce anyway - durability didn't change
                         g_pending[c.slot].active = false;
                         g_localPendingCount--;
-                        p_UpdateInvAlerts();
-                        return;
+                        needInvAlert = true;
+                        hasRestore = true;
                     }
+                } else {
+                    g_pending[c.slot].active = false;
+                    g_localPendingCount--;
+                    // Timed out - will be replayed by timeout loop
                 }
-                g_pending[c.slot].active = false;
-                g_localPendingCount--;
-                // Note: pending entry will be replayed by the timeout loop
             } else if (!isLocal) {
                 // Other player restore - use hash lookup for fast matching
                 int i = findOtherPendingEntry(c.guid, c.slot);
                 if (i >= 0 && now - g_otherPending[i].timestamp < COALESCE_TIMEOUT_MS) {
                     g_otherPending[i].active = false;
                     g_otherPendingCount--;
-                    return;
+                    hasRestore = true;
                 }
             }
         }
     }
 
+    // Second pass: decide whether to drop or pass the packet
+    if (needInvAlert) p_UpdateInvAlerts();
+
+    // Pass through if: real unequip, broken item, or hash table congestion
+    if (hasRealUnequip || hasBrokenItem || hashTableFull) {
+        p_Original(conn, ts, msg);
+        return;
+    }
+
+    // Drop if: only transmog clears/restores (local or other players)
+    if (hasTransmogClear || hasOtherPlayerClear || hasRestore) {
+        return;  // Drop packet
+    }
+
+    // Default: pass through
     p_Original(conn, ts, msg);
 }
 
