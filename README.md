@@ -2,6 +2,13 @@
 
 A client-side fix for WoW 1.12.1 that eliminates frame drops caused by the server's transmogrification durability workaround.
 
+## TL;DR
+
+**Quickstart:** Add `transmogfix.dll` to your `dlls.txt` file.
+
+**Known Issues:**
+- Equipment removal on other players can cause brief visual blinking
+
 ## The Problem
 
 When a transmogrified item's durability changes, the 1.12.1 client re-reads the item's base entry ID from the item cache, losing the transmog appearance. Server developers worked around this by sending 3 packets per item:
@@ -14,12 +21,17 @@ On death, `DurabilityLossAll()` does this for all 19 equipment slots. With a ful
 
 ## The Solution
 
-This fix hooks `NetClient::ProcessMessage` to intercept `SMSG_UPDATE_OBJECT` and `SMSG_COMPRESSED_UPDATE_OBJECT` packets. When it detects the clear→durability→restore pattern within 200ms:
+This fix uses two hooks at the field-write level:
 
-- Drops the clear packet (no visual update triggered)
-- Captures the durability value from packet 2
-- Drops the restore packet (no visual update triggered)
-- Writes durability directly to item descriptor memory
+1. **SetBlock (0x6142E0)** - Intercepts all descriptor field writes
+2. **RefreshVisualAppearance (0x5fb880)** - Skips expensive visual refresh when coalesced
+
+When it detects the clear→durability→restore pattern within 200ms:
+
+- Blocks the VISIBLE_ITEM clear write
+- Captures durability from the durability field write
+- Blocks the VISIBLE_ITEM restore write
+- Applies durability directly to item descriptor
 - Calls `UpdateInventoryAlertStates()` to refresh the UI
 
 Result: Zero visual refreshes, zero frame drops, durability still updates correctly.
@@ -40,14 +52,23 @@ If you're already building a mod DLL with your own hooking library, include the 
 
 // In DLL_PROCESS_ATTACH (after your hook library is initialized):
 if (transmogCoalesce_init() && transmogCoalesce_isHookOwner()) {
-    void* original = nullptr;
+    void* origSetBlock = nullptr;
+    void* origRefresh = nullptr;
 
     // MinHook example:
-    MH_CreateHook(transmogCoalesce_getTargetAddress(),
-                  transmogCoalesce_getHookFunction(), &original);
-    MH_EnableHook(transmogCoalesce_getTargetAddress());
+    // Hook 1: SetBlock (intercepts all field writes)
+    MH_CreateHook(transmogCoalesce_getSetBlockTarget(),
+                  transmogCoalesce_getSetBlockHook(), &origSetBlock);
 
-    transmogCoalesce_setOriginal(original);
+    // Hook 2: RefreshVisualAppearance (skips expensive refresh)
+    MH_CreateHook(transmogCoalesce_getRefreshTarget(),
+                  transmogCoalesce_getRefreshHook(), &origRefresh);
+
+    // Set trampolines BEFORE enabling
+    transmogCoalesce_setSetBlockOriginal(origSetBlock);
+    transmogCoalesce_setRefreshOriginal(origRefresh);
+
+    MH_EnableHook(MH_ALL_HOOKS);
 }
 
 // In DLL_PROCESS_DETACH:
@@ -77,12 +98,17 @@ The Makefile automatically fetches the MinHook submodule if needed.
 // Initialization
 bool transmogCoalesce_init();           // Call first, returns false on failure
 void transmogCoalesce_cleanup();        // Call on unload
-bool transmogCoalesce_isHookOwner();    // True if this DLL should install hook
+bool transmogCoalesce_isHookOwner();    // True if this DLL should install hooks
 
-// Hook installation (for embedding)
-void* transmogCoalesce_getTargetAddress();   // Returns 0x537AA0
-void* transmogCoalesce_getHookFunction();    // Returns hook function pointer
-void  transmogCoalesce_setOriginal(void* trampoline);  // Set original function
+// Hook 1: SetBlock (0x6142E0) - intercepts all field writes
+void* transmogCoalesce_getSetBlockTarget();
+void* transmogCoalesce_getSetBlockHook();
+void  transmogCoalesce_setSetBlockOriginal(void* trampoline);
+
+// Hook 2: RefreshVisualAppearance (0x5fb880) - skips expensive visual refresh
+void* transmogCoalesce_getRefreshTarget();
+void* transmogCoalesce_getRefreshHook();
+void  transmogCoalesce_setRefreshOriginal(void* trampoline);
 
 // Runtime control
 void transmogCoalesce_setEnabled(bool enabled);
@@ -91,15 +117,15 @@ bool transmogCoalesce_isEnabled();
 
 ## How It Works
 
-The fix identifies the transmog durability pattern by tracking state per equipment slot:
+The fix identifies the transmog durability pattern by intercepting field writes at the SetBlock level:
 
-1. **Clear detected**: `PLAYER_VISIBLE_ITEM_X_0 = 0` without `PLAYER_FIELD_INV_SLOT` also being cleared (which would indicate a real unequip). Buffer the packet, start 200ms timer.
+1. **Clear detected**: SetBlock called with `PLAYER_VISIBLE_ITEM_X_0 = 0`. Block the write, save original value, start 200ms timer.
 
-2. **Durability captured**: While a slot is pending, if we see `ITEM_FIELD_DURABILITY` for the item in that slot, capture the value.
+2. **Durability captured**: While a slot is pending, if SetBlock is called for `ITEM_FIELD_DURABILITY` on the equipped item, capture the value and block that write too.
 
-3. **Restore detected**: `PLAYER_VISIBLE_ITEM_X_0 = itemId` within timeout. If we captured durability and it's > 0, write directly to memory and skip the packet. If durability = 0, let it through (broken item needs visual).
+3. **Restore detected**: SetBlock called with `PLAYER_VISIBLE_ITEM_X_0 = originalValue` within timeout. If we captured durability and it's > 0, apply durability directly to memory and block the restore write. If durability = 0, let it through (broken item needs visual update).
 
-4. **Timeout**: If restore doesn't arrive within 200ms, replay the buffered clear packet normally.
+4. **Timeout**: If restore doesn't arrive within 200ms, apply the blocked clear via the original SetBlock.
 
 ## Note to Server Developers
 
