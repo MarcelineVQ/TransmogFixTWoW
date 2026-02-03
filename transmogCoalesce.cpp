@@ -1,26 +1,7 @@
 #include <windows.h>
 #include "transmogCoalesce.h"
+#include <cstdint>
 #include <cstring>
-
-// =============================================================================
-// Client's zlib uncompress function
-// =============================================================================
-typedef int (__fastcall *UncompressFunc)(uint8_t* dest, uint32_t* destLen,
-                                          const uint8_t* source, uint32_t sourceLen);
-static UncompressFunc clientUncompress = (UncompressFunc)0x00734810;
-
-// =============================================================================
-// CDataStore - must match game's layout exactly (vtable at offset 0!)
-// =============================================================================
-
-struct CDataStore {
-    uint32_t vtable;
-    uint8_t* m_data;
-    uint32_t m_base;
-    uint32_t m_alloc;
-    uint32_t m_size;
-    uint32_t m_read;
-};
 
 // =============================================================================
 // Game client function pointers and addresses
@@ -30,28 +11,56 @@ struct CDataStore {
 typedef uint64_t(__fastcall* UnitGUID_t)(const char*);
 static UnitGUID_t p_UnitGUID = reinterpret_cast<UnitGUID_t>(0x515970);
 
-// ClntObjMgrObjectPtr @ 0x464870: uint32_t __fastcall GetObjectByGUID(uint64_t guid)
-typedef uint32_t(__fastcall* GetObjectByGUID_t)(uint64_t);
+// ClntObjMgrObjectPtr @ 0x464870: uint32_t __stdcall GetObjectByGUID(guidLow, guidHigh)
+// NOTE: This is __stdcall, NOT __fastcall! Params on stack, callee cleans (RET 8)
+typedef uint32_t(__stdcall* GetObjectByGUID_t)(uint32_t guidLow, uint32_t guidHigh);
 static GetObjectByGUID_t p_GetObjectByGUID = reinterpret_cast<GetObjectByGUID_t>(0x464870);
-
-// NetClient::ProcessMessage @ 0x537AA0
-typedef void(__thiscall* ProcessMessage_t)(void*, uint32_t, CDataStore*);
-static ProcessMessage_t p_Original = nullptr;
 
 // UpdateInventoryAlertStates @ 0x4c7ee0: fires UNIT_INVENTORY_CHANGED event
 typedef void(*UpdateInvAlerts_t)();
 static UpdateInvAlerts_t p_UpdateInvAlerts = reinterpret_cast<UpdateInvAlerts_t>(0x4c7ee0);
 
+// CGObject_C__SetBlock @ 0x6142E0 - ALL field writes go through here
+// __thiscall: this in ECX, other params on stack
+typedef void*(__thiscall* SetBlock_t)(void* obj, int index, void* value);
+static SetBlock_t p_OriginalSetBlock = nullptr;
+
+// CGUnit_C__RefreshVisualAppearance @ 0x5fb880 - expensive visual refresh
+// __thiscall: this in ECX, params on stack
+typedef void(__thiscall* RefreshVisualAppearance_t)(void* unit, void* eventData, void* extraData, char forceUpdate);
+static RefreshVisualAppearance_t p_OriginalRefresh = nullptr;
+
+// CGUnit_C__RefreshAppearanceAndEquipment @ 0x60afb0 - CHEAP cache update only
+typedef void(__fastcall* RefreshAppearance_t)(void*);
+static RefreshAppearance_t p_RefreshAppearance = reinterpret_cast<RefreshAppearance_t>(0x60afb0);
+
+// CGUnit_C__RefreshEquipmentDisplay @ 0x60ABE0 - triggers full visual update
+typedef void(__fastcall* RefreshEquipmentDisplay_t)(void*);
+static RefreshEquipmentDisplay_t p_RefreshEquipmentDisplay = reinterpret_cast<RefreshEquipmentDisplay_t>(0x60ABE0);
+
+// Global CreatureDisplayInfo table pointer at 0x00c0de90
+// Access: (*PTR_00c0de90)[displayId] -> ModelData*
+static uint32_t*** g_displayInfoTablePtr = reinterpret_cast<uint32_t***>(0x00c0de90);
+
+// Display ID for the BOX model (small cube) - used to invalidate model cache
+static constexpr uint32_t DISPLAY_ID_BOX = 4;
+
+// Cached ModelData offset in unit: unit + 0xb34
+static constexpr uint32_t UNIT_CACHED_MODELDATA_OFFSET = 0xb34;
+
 // =============================================================================
-// Field offsets (1.12.1 client)
+// Constants and field offsets (1.12.1 client)
 // =============================================================================
 
-constexpr uint32_t PLAYER_VISIBLE_ITEM_1_0 = 0x0F8;  // Field 248 - first visible item slot
-constexpr uint32_t VISIBLE_ITEM_STRIDE = 0x0C;        // 12 fields per equipment slot
-constexpr uint32_t ITEM_FIELD_DURABILITY = 0x2E;      // Field 46 on item objects
-constexpr uint32_t PLAYER_FIELD_INV_SLOT_HEAD = 0x1DA; // Field 474 - inventory slot GUIDs
-constexpr uint32_t PLAYER_INV_SLOT_HEAD_BYTES = PLAYER_FIELD_INV_SLOT_HEAD * 4;  // 0x768
-constexpr uint32_t COALESCE_TIMEOUT_MS = 200;
+static constexpr uint32_t PLAYER_VISIBLE_ITEM_1_0 = 0x0F8;   // Field 248 - first visible item slot
+static constexpr uint32_t VISIBLE_ITEM_STRIDE = 0x0C;         // 12 fields per equipment slot
+static constexpr uint32_t ITEM_FIELD_DURABILITY = 0x2E;       // Field 46 on item objects
+static constexpr uint32_t PLAYER_FIELD_INV_SLOT_HEAD = 0x1DA; // Field 474 - inventory slot GUIDs
+static constexpr uint32_t PLAYER_INV_SLOT_HEAD_BYTES = PLAYER_FIELD_INV_SLOT_HEAD * 4;  // 0x768
+static constexpr uint32_t COALESCE_TIMEOUT_MS = 200;
+
+static constexpr uint32_t ADDR_SetBlock = 0x6142E0;
+static constexpr uint32_t ADDR_RefreshVisualAppearance = 0x5fb880;
 
 // =============================================================================
 // State
@@ -62,26 +71,42 @@ static bool g_initialized = false;
 static bool g_isHookOwner = false;
 static HANDLE g_mutex = nullptr;
 
+// Local player pending state (19 equipment slots)
 struct LocalPending {
-    uint32_t timestamp;
-    uint32_t durability;
-    bool hasDur;
+    uint32_t originalVisibleItem;  // Value before clear
+    uint32_t timestamp;            // When clear was detected
+    uint32_t capturedDurability;   // Durability captured from SetBlock
     bool active;
+    bool hasDurability;
 };
-static LocalPending g_pending[19] = {};
+static LocalPending g_localPending[19] = {};
+static int g_localPendingCount = 0;
 
-// Other players: track clears waiting for restores using direct-mapped hash table
-// Hash table size should be prime and ~2x expected max entries for good distribution
+// Other players: hash table for (guid, slot) -> pending state
 static constexpr int OTHER_PENDING_SIZE = 1031;  // Prime number, handles ~500 active entries well
 struct OtherPending {
     uint64_t guid;
     int slot;
     uint32_t timestamp;
+    void* unitPtr;      // Cached for timeout recovery
     bool active;
 };
 static OtherPending g_otherPending[OTHER_PENDING_SIZE] = {};
-static int g_localPendingCount = 0;   // Track active local pending entries
-static int g_otherPendingCount = 0;   // Track active other pending entries
+static int g_otherPendingCount = 0;
+
+// Cached VISIBLE_ITEM values for SetBlock (maintained by SetBlock, not read from descriptor)
+static uint32_t g_cachedVisibleItem[19] = {};
+
+// Unit cache for RefreshVisualAppearance - tracks VISIBLE_ITEM changes per unit
+static constexpr int UNIT_CACHE_SIZE = 64;
+struct UnitVisualState {
+    uint64_t guid;
+    uint32_t lastSeen;                    // Timestamp of last RefreshVisualAppearance
+    uint32_t visibleItems[19];            // Cached VISIBLE_ITEM values
+    uint32_t clearTimestamp[19];          // When each slot was cleared (0 if not pending)
+    bool hasPendingClear;                 // True if any slot has pending clear
+};
+static UnitVisualState g_unitCache[UNIT_CACHE_SIZE] = {};
 
 // =============================================================================
 // Object manager helpers
@@ -93,6 +118,7 @@ struct CachedPlayerState {
     uint32_t playerObj;
     uint32_t playerDesc;
     uint64_t equippedGUIDs[19];
+    uint32_t visibleItems[19];  // Current VISIBLE_ITEM values
     bool valid;
 };
 static CachedPlayerState g_cache = {};
@@ -103,17 +129,23 @@ static bool cachePlayerState() {
     g_cache.localGUID = p_UnitGUID("player");
     if (g_cache.localGUID == 0) return false;
 
-    g_cache.playerObj = p_GetObjectByGUID(g_cache.localGUID);
+    g_cache.playerObj = p_GetObjectByGUID(
+        (uint32_t)(g_cache.localGUID & 0xFFFFFFFF),
+        (uint32_t)(g_cache.localGUID >> 32));
     if (!g_cache.playerObj || (g_cache.playerObj & 1)) return false;
 
     g_cache.playerDesc = *reinterpret_cast<uint32_t*>(g_cache.playerObj + 0x8);
     if (!g_cache.playerDesc || (g_cache.playerDesc & 1)) return false;
 
-    // Cache all 19 equipped item GUIDs
+    // Cache all 19 equipped item GUIDs and current VISIBLE_ITEM values
     for (int slot = 0; slot < 19; slot++) {
         int adjustedSlot = slot + 5;
         g_cache.equippedGUIDs[slot] = *reinterpret_cast<uint64_t*>(
             g_cache.playerDesc + PLAYER_INV_SLOT_HEAD_BYTES + adjustedSlot * 8);
+
+        int fieldIndex = PLAYER_VISIBLE_ITEM_1_0 + (slot * VISIBLE_ITEM_STRIDE);
+        g_cache.visibleItems[slot] = *reinterpret_cast<uint32_t*>(
+            g_cache.playerDesc + fieldIndex * 4);
     }
 
     g_cache.valid = true;
@@ -127,57 +159,126 @@ static inline uint64_t getCachedEquippedGUID(int slot) {
 
 static inline uint32_t getCachedEquippedItemObject(int slot) {
     uint64_t guid = getCachedEquippedGUID(slot);
-    return guid ? p_GetObjectByGUID(guid) : 0;
+    if (!guid) return 0;
+    return p_GetObjectByGUID((uint32_t)(guid & 0xFFFFFFFF), (uint32_t)(guid >> 32));
 }
 
-
-// =============================================================================
-// Packet parsing helpers
-// =============================================================================
-
-// POPCNT instruction available on all x86 CPUs since 2007 (AMD) / 2008 (Intel)
-static inline int popcount32(uint32_t x) {
-    return __builtin_popcount(x);
-}
-
-// Returns bytes consumed, or 0 on error (not enough data)
-static int readPackedGUID(const uint8_t* buf, uint32_t remaining, uint64_t& out) {
-    if (remaining < 1) return 0;
-    uint8_t mask = buf[0];
-    int needed = 1 + popcount32(mask);
-    if ((uint32_t)needed > remaining) return 0;
-
-    out = 0;
-    int pos = 1;
-    for (int i = 0; i < 8; ++i) {
-        if (mask & (1 << i))
-            out |= static_cast<uint64_t>(buf[pos++]) << (i * 8);
-    }
-    return pos;
-}
-
-// Write a packed GUID to buffer, returns bytes written
-static int writePackedGUID(uint8_t* buf, uint64_t guid) {
-    uint8_t mask = 0;
-    uint8_t bytes[8];
-    int count = 0;
-    for (int i = 0; i < 8; i++) {
-        uint8_t b = (guid >> (i * 8)) & 0xFF;
-        if (b) {
-            mask |= (1 << i);
-            bytes[count++] = b;
+// Write durability directly to item descriptor
+static void writeItemDurabilityDirect(int slot, uint32_t durability) {
+    uint32_t itemObj = getCachedEquippedItemObject(slot);
+    if (itemObj && !(itemObj & 1)) {
+        uint32_t* desc = *reinterpret_cast<uint32_t**>(itemObj + 0x8);
+        if (desc && !((uint32_t)(uintptr_t)desc & 1)) {
+            desc[ITEM_FIELD_DURABILITY] = durability;
         }
     }
-    buf[0] = mask;
-    for (int i = 0; i < count; i++) buf[1 + i] = bytes[i];
-    return 1 + count;
 }
 
+// Find which slot an item GUID belongs to
+static int findSlotForItemGUID(uint64_t itemGuid) {
+    if (!g_cache.valid || itemGuid == 0) return -1;
+    for (int slot = 0; slot < 19; slot++) {
+        if (g_cache.equippedGUIDs[slot] == itemGuid) {
+            return slot;
+        }
+    }
+    return -1;
+}
+
+// Get GUID from unit object pointer
+static uint64_t getUnitGuid(void* unit) {
+    if (!unit) return 0;
+    uint32_t* descPtr = *reinterpret_cast<uint32_t**>((char*)unit + 0x8);
+    if (!descPtr || ((uint32_t)(uintptr_t)descPtr & 1)) return 0;
+    return *reinterpret_cast<uint64_t*>(descPtr);
+}
+
+static bool isPlayerGuid(uint64_t guid) {
+    uint16_t highType = (guid >> 48) & 0xFFFF;
+    return highType == 0x0000;
+}
+
+static bool isItemGuid(uint64_t guid) {
+    uint16_t highType = (guid >> 48) & 0xFFFF;
+    return highType == 0x4000;
+}
+
+// Find or allocate cache entry for a unit GUID
+static UnitVisualState* getUnitCache(uint64_t guid, bool allocate) {
+    int emptySlot = -1;
+    int oldestSlot = 0;
+    uint32_t oldestTime = UINT32_MAX;
+
+    for (int i = 0; i < UNIT_CACHE_SIZE; i++) {
+        if (g_unitCache[i].guid == guid) {
+            return &g_unitCache[i];
+        }
+        if (g_unitCache[i].guid == 0 && emptySlot < 0) {
+            emptySlot = i;
+        }
+        if (g_unitCache[i].lastSeen < oldestTime) {
+            oldestTime = g_unitCache[i].lastSeen;
+            oldestSlot = i;
+        }
+    }
+
+    if (!allocate) return nullptr;
+
+    int slot = (emptySlot >= 0) ? emptySlot : oldestSlot;
+    memset(&g_unitCache[slot], 0, sizeof(UnitVisualState));
+    g_unitCache[slot].guid = guid;
+    return &g_unitCache[slot];
+}
+
+// Read all 19 VISIBLE_ITEM values from a unit's descriptor
+static void readVisibleItems(void* unit, uint32_t* outItems) {
+    uint32_t* desc = *reinterpret_cast<uint32_t**>((char*)unit + 0x8);
+    if (!desc || ((uint32_t)(uintptr_t)desc & 1)) {
+        memset(outItems, 0, 19 * sizeof(uint32_t));
+        return;
+    }
+    for (int slot = 0; slot < 19; slot++) {
+        int fieldIndex = PLAYER_VISIBLE_ITEM_1_0 + (slot * VISIBLE_ITEM_STRIDE);
+        outItems[slot] = desc[fieldIndex];
+    }
+}
+
+// Check if an object is the local player (for SetBlock)
+static bool isLocalPlayerObject(void* obj) {
+    if (!g_cache.valid) return false;
+    return (uint32_t)(uintptr_t)obj == g_cache.playerObj;
+}
+
+// Find which slot an item object belongs to (for SetBlock durability capture)
+static int findSlotForItemObject(void* obj) {
+    if (!g_cache.valid) return -1;
+    uint32_t objAddr = (uint32_t)(uintptr_t)obj;
+    for (int slot = 0; slot < 19; slot++) {
+        uint32_t equipped = getCachedEquippedItemObject(slot);
+        if (equipped == objAddr) {
+            return slot;
+        }
+    }
+    return -1;
+}
+
+// Read a single VISIBLE_ITEM value from a unit's descriptor
+static uint32_t readUnitVisibleItem(void* unit, int slot) {
+    if (!unit || slot < 0 || slot >= 19) return 0;
+    uint32_t* desc = *reinterpret_cast<uint32_t**>((char*)unit + 0x8);
+    if (!desc || ((uint32_t)(uintptr_t)desc & 1)) return 0;
+    int fieldIndex = PLAYER_VISIBLE_ITEM_1_0 + (slot * VISIBLE_ITEM_STRIDE);
+    return desc[fieldIndex];
+}
+
+
+// =============================================================================
+// Other player hash table helpers
+// =============================================================================
+
 // Direct-mapped hash for (guid, slot) -> table index
-// Uses linear probing for collisions
 static inline uint32_t hashGuidSlot(uint64_t guid, int slot) {
-    // Mix guid and slot, then mod by table size
-    uint64_t h = guid ^ (uint64_t(slot) * 2654435761ULL);  // Knuth multiplicative hash
+    uint64_t h = guid ^ (uint64_t(slot) * 2654435761ULL);
     h ^= h >> 33;
     h *= 0xff51afd7ed558ccdULL;
     h ^= h >> 33;
@@ -185,515 +286,487 @@ static inline uint32_t hashGuidSlot(uint64_t guid, int slot) {
 }
 
 // Find existing entry or empty slot for (guid, slot) pair
-// Returns index, or -1 if table is full (shouldn't happen with proper sizing)
 static int findOtherPendingSlot(uint64_t guid, int slot) {
     uint32_t idx = hashGuidSlot(guid, slot);
-
-    // Linear probe up to 32 slots (should rarely need more than 1-2)
     for (int probe = 0; probe < 32; probe++) {
         uint32_t i = (idx + probe) % OTHER_PENDING_SIZE;
         if (!g_otherPending[i].active)
-            return i;  // Empty slot
+            return i;
         if (g_otherPending[i].guid == guid && g_otherPending[i].slot == slot)
-            return i;  // Found existing
+            return i;
     }
-    return -1;  // Table too full (increase OTHER_PENDING_SIZE)
+    return -1;
 }
 
 // Find existing entry only (for restore matching)
 static int findOtherPendingEntry(uint64_t guid, int slot) {
     uint32_t idx = hashGuidSlot(guid, slot);
-
     for (int probe = 0; probe < 32; probe++) {
         uint32_t i = (idx + probe) % OTHER_PENDING_SIZE;
         if (!g_otherPending[i].active)
-            return -1;  // Hit empty slot, not found
+            return -1;
         if (g_otherPending[i].guid == guid && g_otherPending[i].slot == slot)
-            return i;  // Found
+            return i;
     }
     return -1;
 }
 
-// Mapping of equipment slot to (mask_block, bit) for VISIBLE_ITEM fields
-// Field 248 + slot*12 -> block = field/32, bit = field%32
-static const struct { uint8_t block; uint8_t bit; } g_slotToBit[19] = {
-    {7, 24}, {8, 4},  {8, 16}, {8, 28},  // slots 0-3
-    {9, 8},  {9, 20}, {10, 0}, {10, 12}, // slots 4-7
-    {10, 24},{11, 4}, {11, 16},{11, 28}, // slots 8-11
-    {12, 8}, {12, 20},{13, 0}, {13, 12}, // slots 12-15
-    {13, 24},{14, 4}, {14, 16}           // slots 16-18
-};
+// =============================================================================
+// Timeout Processing
+// =============================================================================
 
-// Build a minimal SMSG_UPDATE_OBJECT packet to clear a VISIBLE_ITEM slot
-// Returns packet size, writes to buf (must be at least 128 bytes)
-static int buildVisibleItemClearPacket(uint8_t* buf, uint64_t guid, int slot) {
-    if (slot < 0 || slot >= 19) return 0;
-    int pos = 0;
+static void processTimeouts(uint32_t now) {
+    // Local player timeouts - replay the blocked clear via SetBlock
+    if (g_localPendingCount > 0 && g_cache.valid && p_OriginalSetBlock) {
+        void* playerObj = (void*)(uintptr_t)g_cache.playerObj;
+        for (int slot = 0; slot < 19; slot++) {
+            if (g_localPending[slot].active) {
+                uint32_t elapsed = now - g_localPending[slot].timestamp;
+                if (elapsed >= COALESCE_TIMEOUT_MS) {
+                    // Replay the blocked clear via SetBlock
+                    int fieldIndex = PLAYER_VISIBLE_ITEM_1_0 + (slot * VISIBLE_ITEM_STRIDE);
+                    p_OriginalSetBlock(playerObj, fieldIndex, (void*)0);
 
-    // Opcode: SMSG_UPDATE_OBJECT = 0x00A9
-    buf[pos++] = 0xA9;
-    buf[pos++] = 0x00;
+                    // Update our cache
+                    g_cachedVisibleItem[slot] = 0;
 
-    // Block count = 1
-    *reinterpret_cast<uint32_t*>(buf + pos) = 1; pos += 4;
-
-    // hasTransport = 0
-    buf[pos++] = 0;
-
-    // updateType = 0 (UPDATETYPE_VALUES)
-    buf[pos++] = 0;
-
-    // Packed GUID
-    pos += writePackedGUID(buf + pos, guid);
-
-    // Mask: need blocks 0 through g_slotToBit[slot].block
-    uint8_t maskCnt = g_slotToBit[slot].block + 1;
-    buf[pos++] = maskCnt;
-
-    // Write mask blocks (all zero except the one with our bit)
-    for (int i = 0; i < maskCnt; i++) {
-        uint32_t m = 0;
-        if (i == g_slotToBit[slot].block)
-            m = 1u << g_slotToBit[slot].bit;
-        *reinterpret_cast<uint32_t*>(buf + pos) = m; pos += 4;
+                    g_localPending[slot].active = false;
+                    g_localPending[slot].hasDurability = false;
+                    g_localPendingCount--;
+                }
+            }
+        }
     }
 
-    // Value = 0 (clearing the VISIBLE_ITEM)
-    *reinterpret_cast<uint32_t*>(buf + pos) = 0; pos += 4;
+    // Other player timeouts - replay the blocked clear via SetBlock, then force visual update
+    if (g_otherPendingCount > 0 && p_OriginalSetBlock) {
+        // Track units and their expired slots
+        struct UnitSlots {
+            void* unit;
+            int slots[19];
+            int slotCount;
+        };
+        UnitSlots unitsToUpdate[16] = {};
+        int unitCount = 0;
 
-    return pos;
-}
+        for (int i = 0; i < OTHER_PENDING_SIZE; i++) {
+            if (g_otherPending[i].active) {
+                uint32_t elapsed = now - g_otherPending[i].timestamp;
+                if (elapsed >= COALESCE_TIMEOUT_MS) {
+                    // Replay the blocked clear via SetBlock
+                    if (g_otherPending[i].unitPtr && p_OriginalSetBlock) {
+                        int fieldIndex = PLAYER_VISIBLE_ITEM_1_0 + (g_otherPending[i].slot * VISIBLE_ITEM_STRIDE);
+                        p_OriginalSetBlock(g_otherPending[i].unitPtr, fieldIndex, (void*)0);
 
-// =============================================================================
-// SMSG_UPDATE_OBJECT parsing
-// =============================================================================
-
-struct Change { uint64_t guid; int slot; uint32_t value; };
-struct DurChange { uint64_t guid; uint32_t dur; };
-
-// Static parse buffers - avoid heap allocations per packet
-static constexpr int MAX_VISIBLE_CHANGES = 19;   // Max equipment slots
-static constexpr int MAX_DUR_CHANGES = 19;       // Max equipped items
-static constexpr int MAX_MASK_BLOCKS = 64;       // Covers all possible fields
-
-struct Parsed {
-    Change visible[MAX_VISIBLE_CHANGES];
-    int visibleCount;
-    DurChange durability[MAX_DUR_CHANGES];
-    int durabilityCount;
-    bool invClear[19];
-    bool durCaptured;      // True if durability was captured for a pending slot (DROP packet)
-    bool valid;
-};
-
-static Parsed parse(const uint8_t* data, uint32_t size, uint64_t local) {
-    Parsed r = {};
-    r.valid = false;
-    r.visibleCount = 0;
-    r.durabilityCount = 0;
-    r.durCaptured = false;
-    uint32_t pos = 2;
-
-    if (pos + 5 > size) return r;
-    uint32_t blocks = *reinterpret_cast<const uint32_t*>(data + pos); pos += 4;
-    uint8_t hasTransport = data[pos++];
-    if (hasTransport) return r;
-
-    for (uint32_t b = 0; b < blocks; ++b) {
-        if (pos + 1 > size) return r;
-        uint8_t updateType = data[pos++];
-        if (updateType != 0) return r;  // Not UPDATETYPE_VALUES
-
-        uint64_t guid;
-        int guidLen = readPackedGUID(data + pos, size - pos, guid);
-        if (guidLen == 0) return r;
-        pos += guidLen;
-        if (pos + 1 > size) return r;
-
-        // Quick check: is this a player or item GUID?
-        uint16_t guidType = (guid >> 48) & 0xFFFF;
-        bool isPlayer = (guidType == 0x0000);  // Player GUIDs have high bits = 0
-        bool isItem = (guidType == 0x4000);    // Item GUIDs have high bits = 0x4000
-
-        uint8_t maskCnt = data[pos++];
-        if (maskCnt > MAX_MASK_BLOCKS || pos + maskCnt * 4 > size) return r;
-
-        uint32_t mask[MAX_MASK_BLOCKS];
-        int valCnt = 0;
-        for (int i = 0; i < maskCnt; ++i) {
-            mask[i] = *reinterpret_cast<const uint32_t*>(data + pos);
-            pos += 4;
-            valCnt += popcount32(mask[i]);
-        }
-        if (pos + valCnt * 4 > size) return r;
-
-        // Quick bail: check GUID type and mask for fields we care about
-        // ITEM_FIELD_DURABILITY (0x2E=46) is in mask block 1, bit 14
-        // PLAYER_VISIBLE_ITEM fields (0x0F8+) start at mask block 7 (248/32=7)
-        // PLAYER_FIELD_INV_SLOT fields for equipment (484-520) are in mask blocks 15-16
-        bool mayHaveDurability = isItem && (maskCnt >= 2) && (mask[1] & (1 << 14));
-        bool mayHavePlayerFields = isPlayer && (maskCnt >= 8);  // Visible items or inv slots
-        if (!mayHaveDurability && !mayHavePlayerFields) {
-            pos += valCnt * 4;
-            continue;
-        }
-
-        // Optimization: Direct field extraction instead of iterating all bits
-        // We only care about: DURABILITY (field 46), VISIBLE_ITEM (248+), INV_SLOT (474+)
-
-        const uint8_t* values = data + pos;
-
-        // Pre-compute cumulative bit counts for O(1) value index lookup
-        // blockOffset[i] = total set bits in blocks 0..i-1
-        int blockOffset[MAX_MASK_BLOCKS + 1];
-        blockOffset[0] = 0;
-        for (int i = 0; i < maskCnt; ++i)
-            blockOffset[i + 1] = blockOffset[i] + popcount32(mask[i]);
-
-        // DURABILITY: field 46 = block 1, bit 14 - direct extraction
-        if (mayHaveDurability && (mask[1] & (1 << 14))) {
-            // Value index = bits before block 1 + bits 0-13 in block 1
-            int vi = blockOffset[1] + popcount32(mask[1] & 0x3FFF);
-            uint32_t val = *reinterpret_cast<const uint32_t*>(values + vi * 4);
-
-            if (r.durabilityCount < MAX_DUR_CHANGES)
-                r.durability[r.durabilityCount++] = {guid, val};
-
-            // Inline capture for pending slots
-            if (!r.durCaptured && g_localPendingCount > 0) {
-                for (int s = 0; s < 19; s++) {
-                    if (g_pending[s].active && getCachedEquippedGUID(s) == guid) {
-                        g_pending[s].durability = val;
-                        g_pending[s].hasDur = true;
-                        r.durCaptured = true;
-                        break;
+                        // Track unit for visual update
+                        int unitIdx = -1;
+                        for (int j = 0; j < unitCount; j++) {
+                            if (unitsToUpdate[j].unit == g_otherPending[i].unitPtr) {
+                                unitIdx = j;
+                                break;
+                            }
+                        }
+                        if (unitIdx < 0 && unitCount < 16) {
+                            unitIdx = unitCount++;
+                            unitsToUpdate[unitIdx].unit = g_otherPending[i].unitPtr;
+                            unitsToUpdate[unitIdx].slotCount = 0;
+                        }
+                        if (unitIdx >= 0 && unitsToUpdate[unitIdx].slotCount < 19) {
+                            unitsToUpdate[unitIdx].slots[unitsToUpdate[unitIdx].slotCount++] = g_otherPending[i].slot;
+                        }
                     }
+
+                    g_otherPending[i].active = false;
+                    g_otherPendingCount--;
                 }
             }
         }
 
-        // VISIBLE_ITEM & INV_SLOT: blocks 7-16 (VISIBLE_ITEM in 7-14, INV_SLOT in 15-16)
-        if (mayHavePlayerFields) {
-            int endBlock = (maskCnt < 17) ? maskCnt : 17;
+        // Process each unit: invalidate model cache and call RefreshEquipmentDisplay ONCE
+        if (unitCount > 0) {
+            for (int i = 0; i < unitCount; i++) {
+                void* unit = unitsToUpdate[i].unit;
 
-            for (int mi = 7; mi < endBlock; ++mi) {
-                uint32_t m = mask[mi];
-                if (m == 0) continue;  // Skip empty blocks
+                // Get the ModelData pointer for the BOX display ID (used to invalidate cache)
+                uint32_t* boxModelData = nullptr;
+                if (g_displayInfoTablePtr && *g_displayInfoTablePtr) {
+                    uint32_t** displayTable = *g_displayInfoTablePtr;
+                    boxModelData = displayTable[DISPLAY_ID_BOX];
+                }
 
-                // Iterate only set bits using clear-lowest-bit pattern
-                while (m) {
-                    // Find lowest set bit position
-                    uint32_t isolated = m & (~m + 1);  // Isolate lowest bit
-                    int bit = 0;
-                    if (isolated & 0xFFFF0000) bit += 16;
-                    if (isolated & 0xFF00FF00) bit += 8;
-                    if (isolated & 0xF0F0F0F0) bit += 4;
-                    if (isolated & 0xCCCCCCCC) bit += 2;
-                    if (isolated & 0xAAAAAAAA) bit += 1;
+                if (boxModelData) {
+                    // Set the cached ModelData to BOX model - this forces ShouldUpdateDisplayInfo = true
+                    *(uint32_t**)((char*)unit + UNIT_CACHED_MODELDATA_OFFSET) = boxModelData;
 
-                    uint32_t field = mi * 32 + bit;
-                    // Value index = bits before this block + bits before this bit in block
-                    int vi = blockOffset[mi] + popcount32(mask[mi] & ((1u << bit) - 1));
-                    uint32_t val = *reinterpret_cast<const uint32_t*>(values + vi * 4);
+                    // Call RefreshEquipmentDisplay to rebuild the visual
+                    p_RefreshEquipmentDisplay(unit);
+                }
+                else {
+                    // Fallback to RefreshVisualAppearance
+                    if (p_OriginalRefresh) {
+                        p_OriginalRefresh(unit, nullptr, nullptr, 1);
+                    }
+                }
+            }
+        }
+    }
+}
 
-                    // VISIBLE_ITEM: fields 248-464 (slots 0-18, stride 12)
-                    if (field >= PLAYER_VISIBLE_ITEM_1_0 && field < PLAYER_VISIBLE_ITEM_1_0 + 19 * VISIBLE_ITEM_STRIDE) {
-                        uint32_t off = field - PLAYER_VISIBLE_ITEM_1_0;
-                        if (off % VISIBLE_ITEM_STRIDE == 0) {
-                            if (r.visibleCount < MAX_VISIBLE_CHANGES) {
-                                r.visible[r.visibleCount++] = {guid, (int)(off / VISIBLE_ITEM_STRIDE), val};
+// =============================================================================
+// Hook 1: SetBlock (0x6142E0) - intercepts all field writes
+// =============================================================================
+// __thiscall: ECX = this, params on stack
+// We use __fastcall with dummy EDX to capture ECX properly in MinHook
+
+static void* __fastcall Hook_SetBlock(void* obj, void* edx, int index, void* value) {
+    (void)edx;
+    uint32_t val = (uint32_t)(uintptr_t)value;
+
+    // ==========================================================================
+    // VISIBLE_ITEM writes - detect and block transmog pattern
+    // ==========================================================================
+    if (index >= (int)PLAYER_VISIBLE_ITEM_1_0 &&
+        index < (int)(PLAYER_VISIBLE_ITEM_1_0 + 19 * VISIBLE_ITEM_STRIDE)) {
+
+        int offset = index - PLAYER_VISIBLE_ITEM_1_0;
+        if (offset % VISIBLE_ITEM_STRIDE == 0) {  // First field of slot (item entry)
+            int slot = offset / VISIBLE_ITEM_STRIDE;
+
+            // Cache player state if not done yet
+            if (!g_cache.valid) cachePlayerState();
+
+            uint32_t now = GetTickCount();
+
+            if (g_enabled && isLocalPlayerObject(obj)) {
+                // =========== LOCAL PLAYER ===========
+                if (val == 0 && g_cachedVisibleItem[slot] != 0) {
+                    // CLEAR detected - start transmog pattern tracking
+                    if (!g_localPending[slot].active) g_localPendingCount++;
+                    g_localPending[slot].originalVisibleItem = g_cachedVisibleItem[slot];
+                    g_localPending[slot].timestamp = now;
+                    g_localPending[slot].active = true;
+                    g_localPending[slot].hasDurability = false;
+                    // BLOCK the clear write - visual stays unchanged
+                    return (void*)1;
+                }
+                else if (val != 0 && g_localPending[slot].active) {
+                    uint32_t elapsed = now - g_localPending[slot].timestamp;
+                    if (elapsed < COALESCE_TIMEOUT_MS && val == g_localPending[slot].originalVisibleItem) {
+                        // RESTORE detected within timeout - transmog pattern confirmed!
+
+                        // Apply captured durability if we have it
+                        if (g_localPending[slot].hasDurability) {
+                            uint32_t dur = g_localPending[slot].capturedDurability;
+                            if (dur != 0) {
+                                writeItemDurabilityDirect(slot, dur);
+                            } else {
+                                // Don't block - broken items need visual update
+                                g_localPending[slot].active = false;
+                                g_localPending[slot].hasDurability = false;
+                                g_localPendingCount--;
+                                goto passthrough;
+                            }
+                        }
+                        g_localPending[slot].active = false;
+                        g_localPending[slot].hasDurability = false;
+                        g_localPendingCount--;
+
+                        // Fire inventory alert for UI update
+                        if (p_UpdateInvAlerts) p_UpdateInvAlerts();
+
+                        // Block the restore write - visual stays unchanged
+                        return (void*)1;
+                    }
+                    else {
+                        // Timeout or different item - real gear change
+                        g_localPending[slot].active = false;
+                        g_localPending[slot].hasDurability = false;
+                        g_localPendingCount--;
+                    }
+                }
+
+                // Update cache for non-blocked writes
+                if (val != 0) {
+                    g_cachedVisibleItem[slot] = val;
+                }
+            }
+            else if (g_enabled) {
+                // =========== OTHER PLAYERS ===========
+                uint64_t guid = getUnitGuid(obj);
+                if (guid != 0 && isPlayerGuid(guid)) {
+                    int idx = findOtherPendingEntry(guid, slot);
+
+                    if (val == 0) {
+                        // CLEAR detected - read current value before the write
+                        uint32_t currentVal = readUnitVisibleItem(obj, slot);
+                        if (currentVal != 0) {
+                            // Start pending tracking
+                            int newIdx = findOtherPendingSlot(guid, slot);
+                            if (newIdx >= 0) {
+                                if (!g_otherPending[newIdx].active) {
+                                    g_otherPendingCount++;
+                                }
+                                g_otherPending[newIdx].guid = guid;
+                                g_otherPending[newIdx].slot = slot;
+                                g_otherPending[newIdx].timestamp = now;
+                                g_otherPending[newIdx].unitPtr = obj;
+                                g_otherPending[newIdx].active = true;
+                                return (void*)1;  // Block the clear
                             }
                         }
                     }
-                    // INV_SLOT: fields 484-521 (indices 5-23 = equipment slots 0-18)
-                    else if (field >= PLAYER_FIELD_INV_SLOT_HEAD + 10 && field < PLAYER_FIELD_INV_SLOT_HEAD + 48) {
-                        uint32_t off = field - PLAYER_FIELD_INV_SLOT_HEAD;
-                        if (off % 2 == 0 && val == 0 && guid == local) {
-                            int visSlot = (off / 2) - 5;
-                            if (visSlot >= 0 && visSlot < 19)
-                                r.invClear[visSlot] = true;
+                    else if (idx >= 0 && g_otherPending[idx].active) {
+                        // Restore - check if within timeout AND same item
+                        uint32_t elapsed = now - g_otherPending[idx].timestamp;
+                        uint32_t currentVal = readUnitVisibleItem(obj, slot);  // Still has original (we blocked clear)
+                        if (elapsed < COALESCE_TIMEOUT_MS && val == currentVal) {
+                            // Same item restored - transmog pattern confirmed
+                            g_otherPending[idx].active = false;
+                            g_otherPendingCount--;
+                            return (void*)1;  // Block the restore
+                        }
+                        else {
+                            // Timeout or different item - let it through
+                            g_otherPending[idx].active = false;
+                            g_otherPendingCount--;
                         }
                     }
-
-                    m &= m - 1;  // Clear lowest bit, move to next
                 }
             }
         }
-        pos += valCnt * 4;
     }
-    r.valid = true;
-    return r;
+
+    // ==========================================================================
+    // DURABILITY writes - capture for pending local player slots
+    // ==========================================================================
+    if (g_enabled && index == (int)ITEM_FIELD_DURABILITY) {
+        // Check if this object is an equipped item with pending transmog
+        int slot = findSlotForItemObject(obj);
+        if (slot >= 0 && g_localPending[slot].active) {
+            // This is durability update for a pending slot - capture it
+            g_localPending[slot].capturedDurability = val;
+            g_localPending[slot].hasDurability = true;
+            return (void*)1;  // Return success without writing
+        }
+    }
+
+    // ==========================================================================
+    // INV_SLOT writes - detect real unequips and cancel pending blocks
+    // ==========================================================================
+    if (index >= (int)PLAYER_FIELD_INV_SLOT_HEAD &&
+        index < (int)(PLAYER_FIELD_INV_SLOT_HEAD + 48)) {
+        int offset = index - PLAYER_FIELD_INV_SLOT_HEAD;
+        int invIndex = offset / 2;
+        bool isLowWord = (offset % 2 == 0);
+
+        // If this is a low word clear (GUID being cleared) for an equipment slot,
+        // and we have a pending VISIBLE_ITEM block, this is a REAL UNEQUIP - replay it now!
+        if (g_enabled && isLowWord && val == 0 && isLocalPlayerObject(obj)) {
+            int equipSlot = invIndex - 5;  // INV_SLOT indices 5-23 map to equipment slots 0-18
+            if (equipSlot >= 0 && equipSlot < 19 && g_localPending[equipSlot].active) {
+                // Replay the blocked VISIBLE_ITEM clear immediately
+                int fieldIndex = PLAYER_VISIBLE_ITEM_1_0 + (equipSlot * VISIBLE_ITEM_STRIDE);
+                if (p_OriginalSetBlock) {
+                    p_OriginalSetBlock(obj, fieldIndex, (void*)0);
+                }
+
+                // Clear the pending state
+                g_cachedVisibleItem[equipSlot] = 0;
+                g_localPending[equipSlot].active = false;
+                g_localPending[equipSlot].hasDurability = false;
+                g_localPendingCount--;
+            }
+        }
+    }
+
+passthrough:
+    // Process timeouts periodically (only when we have pending entries)
+    if (g_localPendingCount > 0 || g_otherPendingCount > 0) {
+        processTimeouts(GetTickCount());
+    }
+
+    // Call original for all non-blocked writes
+    if (p_OriginalSetBlock) {
+        return p_OriginalSetBlock(obj, index, value);
+    }
+    return (void*)1;
 }
 
 // =============================================================================
-// Hook function (exported for user to install with their preferred method)
+// Hook 2: RefreshVisualAppearance (0x5fb880) - skips expensive visual refresh
 // =============================================================================
+// __thiscall: ECX = this, params on stack
+// We use __fastcall with dummy EDX to capture ECX properly in MinHook
 
-void __fastcall transmogCoalesce_hook(void* conn, void* edx, uint32_t ts, CDataStore* msg) {
-    if (!g_enabled || !p_Original || !msg || !msg->m_data || msg->m_size < 2) {
-        if (p_Original) p_Original(conn, ts, msg);
+static void __fastcall Hook_RefreshVisualAppearance(
+    void* unit, void* edx, void* eventData, void* extraData, char forceUpdate)
+{
+    (void)edx;
+
+    if (!g_enabled || !p_OriginalRefresh) {
+        if (p_OriginalRefresh) p_OriginalRefresh(unit, eventData, extraData, forceUpdate);
         return;
     }
 
-    uint16_t opcode = *reinterpret_cast<uint16_t*>(msg->m_data);
-
-    // We handle both SMSG_UPDATE_OBJECT (0x0A9) and SMSG_COMPRESSED_UPDATE_OBJECT (0x1F6)
-    if (opcode != 0x0A9 && opcode != 0x1F6) {
-        p_Original(conn, ts, msg);
+    uint64_t guid = getUnitGuid(unit);
+    if (guid == 0 || !isPlayerGuid(guid)) {
+        p_OriginalRefresh(unit, eventData, extraData, forceUpdate);
         return;
     }
 
     uint32_t now = GetTickCount();
 
-    // Cache player state once per hook invocation
-    if (!cachePlayerState()) {
-        p_Original(conn, ts, msg);
-        return;
-    }
-    uint64_t local = g_cache.localGUID;
+    // Read current VISIBLE_ITEM values
+    uint32_t currentItems[19];
+    readVisibleItems(unit, currentItems);
 
-    // Replay timed-out pending clears (local and other players)
-    // Only scan if we have pending entries
-    if (g_localPendingCount > 0) {
-        for (int s = 0; s < 19; s++) {
-            if (g_pending[s].active && now - g_pending[s].timestamp > COALESCE_TIMEOUT_MS) {
-                // Build fake clear packet and replay
-                static uint8_t fakePacket[128];
-                int pktLen = buildVisibleItemClearPacket(fakePacket, local, s);
-                if (pktLen > 0) {
-                    CDataStore replay = {};
-                    replay.vtable = msg->vtable;
-                    replay.m_data = fakePacket;
-                    replay.m_size = replay.m_alloc = pktLen;
-                    p_Original(conn, ts, &replay);
-                }
-                g_pending[s].active = false;
-                g_localPendingCount--;
+    // Get or create cache entry for this unit
+    UnitVisualState* state = getUnitCache(guid, true);
+    state->lastSeen = now;
+
+    // Analyze changes
+    int clearedSlots = 0;
+    int restoredSlots = 0;
+    bool allRestoresWithinTimeout = true;
+
+    for (int slot = 0; slot < 19; slot++) {
+        uint32_t cached = state->visibleItems[slot];
+        uint32_t current = currentItems[slot];
+
+        if (cached != current) {
+            if (current == 0 && cached != 0) {
+                // CLEAR detected
+                clearedSlots++;
+                state->clearTimestamp[slot] = now;
+                state->hasPendingClear = true;
             }
-        }
-    }
-    // Other player timeouts - only scan if we have pending entries
-    if (g_otherPendingCount > 0) {
-        for (int i = 0; i < OTHER_PENDING_SIZE; i++) {
-            if (g_otherPending[i].active && now - g_otherPending[i].timestamp > COALESCE_TIMEOUT_MS) {
-                static uint8_t fakePacket[128];
-                int pktLen = buildVisibleItemClearPacket(fakePacket, g_otherPending[i].guid, g_otherPending[i].slot);
-                if (pktLen > 0) {
-                    CDataStore replay = {};
-                    replay.vtable = msg->vtable;
-                    replay.m_data = fakePacket;
-                    replay.m_size = replay.m_alloc = pktLen;
-                    p_Original(conn, ts, &replay);
-                }
-                g_otherPending[i].active = false;
-                g_otherPendingCount--;
-            }
-        }
-    }
-
-    // Handle compressed packets - decompress before parsing
-    // Static buffer avoids heap allocation (max uncompressed size ~64KB is rare, most are <4KB)
-    static uint8_t s_decompressBuffer[65536];
-    uint8_t* decompressedData = nullptr;
-    const uint8_t* parseData = msg->m_data;
-    uint32_t parseSize = msg->m_size;
-
-    if (opcode == 0x1F6) {
-        // SMSG_COMPRESSED_UPDATE_OBJECT format:
-        // [2 bytes opcode][4 bytes uncompressed size][compressed data...]
-        if (msg->m_size < 6) {
-            p_Original(conn, ts, msg);
-            return;
-        }
-
-        uint32_t uncompressedSize = *reinterpret_cast<uint32_t*>(msg->m_data + 2);
-        const uint8_t* compressedData = msg->m_data + 6;
-        uint32_t compressedSize = msg->m_size - 6;
-
-        // Check if uncompressed size fits in static buffer (need 2 extra bytes for opcode)
-        if (2 + uncompressedSize > sizeof(s_decompressBuffer)) {
-            p_Original(conn, ts, msg);
-            return;
-        }
-
-        // Use static buffer: 2 bytes for fake opcode + uncompressed data
-        decompressedData = s_decompressBuffer;
-        // Write SMSG_UPDATE_OBJECT opcode so parse() works
-        decompressedData[0] = 0xA9;
-        decompressedData[1] = 0x00;
-
-        uint32_t destLen = uncompressedSize;
-        int ret = clientUncompress(decompressedData + 2, &destLen,
-                                   compressedData, compressedSize);
-        if (ret != 0) {
-            p_Original(conn, ts, msg);
-            return;
-        }
-
-        parseData = decompressedData;
-        parseSize = 2 + destLen;
-    }
-
-    Parsed p = parse(parseData, parseSize, local);
-    if (!p.valid) { p_Original(conn, ts, msg); return; }
-
-    // Durability capture happened inline during parse - check if we should drop
-    if (p.durCaptured) return;
-
-    // Two-pass approach: first categorize all changes, then decide what to do
-    bool hasRealUnequip = false;      // INV_SLOT cleared = real gear removal
-    bool hasTransmogClear = false;    // VISIBLE_ITEM cleared without INV_SLOT = transmog pattern
-    bool hasOtherPlayerClear = false; // Other player visible item cleared
-    bool hasBrokenItem = false;       // Restore with dur=0 needs visual update
-    bool hasRestore = false;          // Any restore we can coalesce
-    bool needInvAlert = false;        // Need to call UpdateInventoryAlertStates
-    bool hashTableFull = false;       // Other player hash table congested
-
-    // First pass: categorize all changes and update pending state
-    for (int idx = 0; idx < p.visibleCount; idx++) {
-        auto& c = p.visible[idx];
-        bool isLocal = (c.guid == local);
-
-        if (c.value == 0) {
-            // CLEAR
-            if (isLocal) {
-                if (p.invClear[c.slot]) {
-                    hasRealUnequip = true;
-                    continue;
-                }
-                // Transmog pattern - set pending for durability capture
-                if (!g_pending[c.slot].active) g_localPendingCount++;
-                g_pending[c.slot] = {now, 0, false, true};
-                hasTransmogClear = true;
-            } else {
-                // Other player - track for coalescing
-                int otherIdx = findOtherPendingSlot(c.guid, c.slot);
-                if (otherIdx >= 0) {
-                    if (!g_otherPending[otherIdx].active) g_otherPendingCount++;
-                    g_otherPending[otherIdx] = {c.guid, c.slot, now, true};
-                    hasOtherPlayerClear = true;
-                } else {
-                    hashTableFull = true;
-                }
-            }
-        } else {
-            // RESTORE
-            if (isLocal && g_pending[c.slot].active) {
-                uint32_t elapsed = now - g_pending[c.slot].timestamp;
+            else if (current != 0 && cached == 0 && state->clearTimestamp[slot] != 0) {
+                // RESTORE detected
+                uint32_t elapsed = now - state->clearTimestamp[slot];
                 if (elapsed < COALESCE_TIMEOUT_MS) {
-                    if (g_pending[c.slot].hasDur) {
-                        uint32_t dur = g_pending[c.slot].durability;
-                        if (dur == 0) {
-                            // Broken item (dur=0) - need visual update
-                            g_pending[c.slot].active = false;
-                            g_localPendingCount--;
-                            hasBrokenItem = true;
-                            continue;
-                        }
-                        // Write durability directly to item descriptor
-                        uint32_t obj = getCachedEquippedItemObject(c.slot);
-                        if (obj && !(obj & 1)) {
-                            uint32_t desc = *reinterpret_cast<uint32_t*>(obj + 0x8);
-                            if (desc && !(desc & 1))
-                                *reinterpret_cast<uint32_t*>(desc + ITEM_FIELD_DURABILITY * 4) = dur;
-                        }
-                        g_pending[c.slot].active = false;
-                        g_localPendingCount--;
-                        needInvAlert = true;
-                        hasRestore = true;
-                    } else {
-                        // No durability captured - item was already at full durability
-                        // Coalesce anyway - durability didn't change
-                        g_pending[c.slot].active = false;
-                        g_localPendingCount--;
-                        needInvAlert = true;
-                        hasRestore = true;
-                    }
+                    restoredSlots++;
                 } else {
-                    g_pending[c.slot].active = false;
-                    g_localPendingCount--;
-                    // Timed out - will be replayed by timeout loop
+                    allRestoresWithinTimeout = false;
                 }
-            } else if (!isLocal) {
-                // Other player restore - use hash lookup for fast matching
-                int i = findOtherPendingEntry(c.guid, c.slot);
-                if (i >= 0 && now - g_otherPending[i].timestamp < COALESCE_TIMEOUT_MS) {
-                    g_otherPending[i].active = false;
-                    g_otherPendingCount--;
-                    hasRestore = true;
-                }
+                state->clearTimestamp[slot] = 0;
+            }
+            else if (current != 0 && cached == 0) {
+                // New equip
+                allRestoresWithinTimeout = false;
+            }
+            else {
+                // Different item
+                allRestoresWithinTimeout = false;
+                state->clearTimestamp[slot] = 0;
             }
         }
     }
 
-    // Second pass: decide whether to drop or pass the packet
-    if (needInvAlert) p_UpdateInvAlerts();
+    // Update cache
+    memcpy(state->visibleItems, currentItems, sizeof(currentItems));
 
-    // Pass through if: real unequip, broken item, or hash table congestion
-    if (hasRealUnequip || hasBrokenItem || hashTableFull) {
-        p_Original(conn, ts, msg);
-        return;
+    // Update hasPendingClear
+    state->hasPendingClear = false;
+    for (int slot = 0; slot < 19; slot++) {
+        if (state->clearTimestamp[slot] != 0) {
+            uint32_t elapsed = now - state->clearTimestamp[slot];
+            if (elapsed >= COALESCE_TIMEOUT_MS) {
+                state->clearTimestamp[slot] = 0;  // Timed out
+            } else {
+                state->hasPendingClear = true;
+            }
+        }
     }
 
-    // Drop if: only transmog clears/restores (local or other players)
-    if (hasTransmogClear || hasOtherPlayerClear || hasRestore) {
-        return;  // Drop packet
+    // Skip if: we have restores AND all changes are restores within timeout
+    bool shouldSkip = (restoredSlots > 0) && (clearedSlots == 0) && allRestoresWithinTimeout;
+
+    if (shouldSkip) {
+        // Do cheap cache update only
+        if (p_RefreshAppearance) {
+            p_RefreshAppearance(unit);
+        }
+        // Set update flags
+        *(uint32_t*)((char*)unit + 0xccc) = 1;
+        *(uint32_t*)((char*)unit + 0xcd0) = 1;
+
+        // Fire inventory alert for local player
+        if (g_cache.valid && guid == g_cache.localGUID && p_UpdateInvAlerts) {
+            p_UpdateInvAlerts();
+        }
+        return;  // Skip expensive refresh
     }
 
-    // Default: pass through
-    p_Original(conn, ts, msg);
+    p_OriginalRefresh(unit, eventData, extraData, forceUpdate);
 }
 
 // =============================================================================
 // Public API
 // =============================================================================
 
-void* transmogCoalesce_getTargetAddress() {
-    return reinterpret_cast<void*>(0x537AA0);
+// Hook 1: SetBlock
+void* transmogCoalesce_getSetBlockTarget() {
+    return reinterpret_cast<void*>(ADDR_SetBlock);
 }
 
-void* transmogCoalesce_getHookFunction() {
-    return reinterpret_cast<void*>(&transmogCoalesce_hook);
+void* transmogCoalesce_getSetBlockHook() {
+    return reinterpret_cast<void*>(&Hook_SetBlock);
 }
 
-void transmogCoalesce_setOriginal(void* original) {
-    p_Original = reinterpret_cast<ProcessMessage_t>(original);
+void transmogCoalesce_setSetBlockOriginal(void* original) {
+    p_OriginalSetBlock = reinterpret_cast<SetBlock_t>(original);
+}
+
+// Hook 2: RefreshVisualAppearance
+void* transmogCoalesce_getRefreshTarget() {
+    return reinterpret_cast<void*>(ADDR_RefreshVisualAppearance);
+}
+
+void* transmogCoalesce_getRefreshHook() {
+    return reinterpret_cast<void*>(&Hook_RefreshVisualAppearance);
+}
+
+void transmogCoalesce_setRefreshOriginal(void* original) {
+    p_OriginalRefresh = reinterpret_cast<RefreshVisualAppearance_t>(original);
 }
 
 bool transmogCoalesce_init() {
     if (g_initialized) return true;
 
     // Multi-DLL safety: only one instance per process should hook
-    // Use process ID in mutex name to allow multiboxing
     char mutexName[64];
     wsprintfA(mutexName, "Local\\TransmogCoalesceHook_%lu", GetCurrentProcessId());
-    g_mutex = CreateMutexA(nullptr, FALSE, mutexName);
+    g_mutex = CreateMutexA(nullptr, TRUE, mutexName);
     if (!g_mutex) return false;
 
     if (GetLastError() == ERROR_ALREADY_EXISTS) {
         CloseHandle(g_mutex);
         g_mutex = nullptr;
-        g_initialized = true;
         g_isHookOwner = false;
-        return true;  // Another DLL in same process has it
+    } else {
+        g_isHookOwner = true;
     }
 
+    // Initialize state
+    memset(g_localPending, 0, sizeof(g_localPending));
+    memset(g_otherPending, 0, sizeof(g_otherPending));
+    memset(&g_cache, 0, sizeof(g_cache));
+    memset(g_unitCache, 0, sizeof(g_unitCache));
+    memset(g_cachedVisibleItem, 0, sizeof(g_cachedVisibleItem));
+    g_localPendingCount = 0;
+    g_otherPendingCount = 0;
+
     g_initialized = true;
-    g_isHookOwner = true;
     return true;
 }
 
 void transmogCoalesce_cleanup() {
     if (!g_initialized) return;
 
-    // Only hook owner has state to clean up
-    if (g_isHookOwner) {
-        if (g_mutex) { CloseHandle(g_mutex); g_mutex = nullptr; }
-        memset(g_pending, 0, sizeof(g_pending));
-        memset(g_otherPending, 0, sizeof(g_otherPending));
-        g_localPendingCount = 0;
-        g_otherPendingCount = 0;
-        p_Original = nullptr;
+    if (g_isHookOwner && g_mutex) {
+        ReleaseMutex(g_mutex);
+        CloseHandle(g_mutex);
+        g_mutex = nullptr;
     }
 
     g_initialized = false;
@@ -703,3 +776,4 @@ void transmogCoalesce_cleanup() {
 bool transmogCoalesce_isHookOwner() { return g_isHookOwner; }
 void transmogCoalesce_setEnabled(bool e) { g_enabled = e; }
 bool transmogCoalesce_isEnabled() { return g_enabled; }
+void transmogCoalesce_setDebugLog(bool) { /* No-op for now */ }

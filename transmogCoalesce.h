@@ -1,5 +1,5 @@
 // =============================================================================
-// transmogCoalesce.h - Transmog Packet Coalescing (1.12.1 Client)
+// transmogCoalesce.h - Transmog Update Coalescing (1.12.1 Client)
 // =============================================================================
 //
 // SPDX-License-Identifier: CC0-1.0
@@ -16,7 +16,7 @@
 #include <cstdint>
 
 // =============================================================================
-// Transmog Packet Coalescing - Standalone Module (1.12.1 Client)
+// Transmog Update Coalescing - Standalone Module (1.12.1 Client)
 // =============================================================================
 //
 // Drop-in fix for death frame drops caused by the server's transmog durability
@@ -30,11 +30,19 @@
 //
 //   // In DLL_PROCESS_ATTACH (after MH_Initialize):
 //   if (transmogCoalesce_init() && transmogCoalesce_isHookOwner()) {
-//       void* original = nullptr;
-//       MH_CreateHook(transmogCoalesce_getTargetAddress(),
-//                     transmogCoalesce_getHookFunction(), &original);
-//       MH_EnableHook(transmogCoalesce_getTargetAddress());
-//       transmogCoalesce_setOriginal(original);
+//       // Hook 1: SetBlock (intercepts all field writes)
+//       void* origSetBlock = nullptr;
+//       MH_CreateHook(transmogCoalesce_getSetBlockTarget(),
+//                     transmogCoalesce_getSetBlockHook(), &origSetBlock);
+//       MH_EnableHook(transmogCoalesce_getSetBlockTarget());
+//       transmogCoalesce_setSetBlockOriginal(origSetBlock);
+//
+//       // Hook 2: RefreshVisualAppearance (skips expensive visual refresh)
+//       void* origRefresh = nullptr;
+//       MH_CreateHook(transmogCoalesce_getRefreshTarget(),
+//                     transmogCoalesce_getRefreshHook(), &origRefresh);
+//       MH_EnableHook(transmogCoalesce_getRefreshTarget());
+//       transmogCoalesce_setRefreshOriginal(origRefresh);
 //   }
 //
 //   // In DLL_PROCESS_DETACH:
@@ -45,23 +53,37 @@
 //   #include <hadesmem/patcher.hpp>
 //   #include "transmogCoalesce.h"
 //
-//   std::unique_ptr<hadesmem::PatchDetour<ProcessMessageT>> g_hook;
+//   std::unique_ptr<hadesmem::PatchDetour<SetBlockT>> g_setBlockHook;
+//   std::unique_ptr<hadesmem::PatchDetour<RefreshT>> g_refreshHook;
 //
 //   // In DLL_PROCESS_ATTACH:
 //   if (transmogCoalesce_init() && transmogCoalesce_isHookOwner()) {
 //       hadesmem::Process process(GetCurrentProcessId());
-//       auto target = reinterpret_cast<ProcessMessageT>(
-//           transmogCoalesce_getTargetAddress());
-//       auto hook = reinterpret_cast<ProcessMessageT>(
-//           transmogCoalesce_getHookFunction());
-//       g_hook = std::make_unique<hadesmem::PatchDetour<ProcessMessageT>>(
-//           process, target, hook);
-//       g_hook->Apply();
-//       transmogCoalesce_setOriginal(g_hook->GetTrampoline());
+//
+//       // Hook 1: SetBlock
+//       auto setBlockTarget = reinterpret_cast<SetBlockT>(
+//           transmogCoalesce_getSetBlockTarget());
+//       auto setBlockHook = reinterpret_cast<SetBlockT>(
+//           transmogCoalesce_getSetBlockHook());
+//       g_setBlockHook = std::make_unique<hadesmem::PatchDetour<SetBlockT>>(
+//           process, setBlockTarget, setBlockHook);
+//       g_setBlockHook->Apply();
+//       transmogCoalesce_setSetBlockOriginal(g_setBlockHook->GetTrampoline());
+//
+//       // Hook 2: RefreshVisualAppearance
+//       auto refreshTarget = reinterpret_cast<RefreshT>(
+//           transmogCoalesce_getRefreshTarget());
+//       auto refreshHook = reinterpret_cast<RefreshT>(
+//           transmogCoalesce_getRefreshHook());
+//       g_refreshHook = std::make_unique<hadesmem::PatchDetour<RefreshT>>(
+//           process, refreshTarget, refreshHook);
+//       g_refreshHook->Apply();
+//       transmogCoalesce_setRefreshOriginal(g_refreshHook->GetTrampoline());
 //   }
 //
 //   // In DLL_PROCESS_DETACH:
-//   g_hook.reset();
+//   g_setBlockHook.reset();
+//   g_refreshHook.reset();
 //   transmogCoalesce_cleanup();
 //
 // DEPENDENCIES:
@@ -87,15 +109,23 @@
 // THE SOLUTION
 // =============================================================================
 //
-// We hook NetClient::ProcessMessage to intercept SMSG_UPDATE_OBJECT (0x0A9)
-// and SMSG_COMPRESSED_UPDATE_OBJECT (0x1F6) packets.
-// When we detect the clear→durability→restore pattern within 200ms:
+// We hook at the field-write level (SetBlock @ 0x6142E0) which catches ALL
+// descriptor field updates regardless of packet path. This is more reliable
+// than packet-level hooks because:
 //
-//   - Skip the clear packet (no visual update)
-//   - Capture durability from packet 2
-//   - Skip the restore packet (no visual update)
-//   - Write durability directly to item descriptor memory
-//   - Call UpdateInventoryAlertStates() to refresh UI
+//   - Catches updates from all packet types (Type 0 VALUES, Type 3/4 visual)
+//   - Works regardless of CheckObjectFlag4() dispatch path
+//   - Single point of interception for all field writes
+//
+// When we detect the clear→restore pattern within 200ms:
+//
+//   - Block the VISIBLE_ITEM clear write (prevents visual flicker)
+//   - Capture durability from the durability write
+//   - Block the VISIBLE_ITEM restore write (coalesced with clear)
+//   - Apply durability directly to item descriptor
+//
+// We also hook RefreshVisualAppearance (0x5fb880) to skip the expensive
+// texture/model loading when we've coalesced a transmog update.
 //
 // =============================================================================
 // NOTE TO SERVER DEVELOPERS
@@ -128,12 +158,22 @@
 bool transmogCoalesce_init();
 void transmogCoalesce_cleanup();
 
-// Hook installation (user provides their own hooking)
-void* transmogCoalesce_getTargetAddress();   // Returns 0x537AA0
-void* transmogCoalesce_getHookFunction();    // Returns our hook function
-void  transmogCoalesce_setOriginal(void* original);  // Set trampoline
-bool  transmogCoalesce_isHookOwner();        // True if this DLL should hook
+// Hook 1: SetBlock (0x6142E0) - intercepts all field writes
+void* transmogCoalesce_getSetBlockTarget();
+void* transmogCoalesce_getSetBlockHook();
+void  transmogCoalesce_setSetBlockOriginal(void* original);
+
+// Hook 2: RefreshVisualAppearance (0x5fb880) - skips expensive visual refresh
+void* transmogCoalesce_getRefreshTarget();
+void* transmogCoalesce_getRefreshHook();
+void  transmogCoalesce_setRefreshOriginal(void* original);
+
+// Hook ownership
+bool  transmogCoalesce_isHookOwner();
 
 // Runtime control
 void transmogCoalesce_setEnabled(bool enabled);
 bool transmogCoalesce_isEnabled();
+
+// Debug logging
+void transmogCoalesce_setDebugLog(bool enabled);
