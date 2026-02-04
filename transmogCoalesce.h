@@ -117,7 +117,7 @@
 //   - Works regardless of CheckObjectFlag4() dispatch path
 //   - Single point of interception for all field writes
 //
-// When we detect the clear→restore pattern within 200ms:
+// When we detect the clear→restore pattern within 100ms:
 //
 //   - Block the VISIBLE_ITEM clear write (prevents visual flicker)
 //   - Capture durability from the durability write

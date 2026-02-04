@@ -26,7 +26,7 @@ This fix uses two hooks at the field-write level:
 1. **SetBlock (0x6142E0)** - Intercepts all descriptor field writes
 2. **RefreshVisualAppearance (0x5fb880)** - Skips expensive visual refresh when coalesced
 
-When it detects the clear→durability→restore pattern within 200ms:
+When it detects the clear→durability→restore pattern within 100ms:
 
 - Blocks the VISIBLE_ITEM clear write
 - Captures durability from the durability field write
@@ -119,13 +119,13 @@ bool transmogCoalesce_isEnabled();
 
 The fix identifies the transmog durability pattern by intercepting field writes at the SetBlock level:
 
-1. **Clear detected**: SetBlock called with `PLAYER_VISIBLE_ITEM_X_0 = 0`. Block the write, save original value, start 200ms timer.
+1. **Clear detected**: SetBlock called with `PLAYER_VISIBLE_ITEM_X_0 = 0`. Block the write, save original value, start 100ms timer.
 
 2. **Durability captured**: While a slot is pending, if SetBlock is called for `ITEM_FIELD_DURABILITY` on the equipped item, capture the value and block that write too.
 
 3. **Restore detected**: SetBlock called with `PLAYER_VISIBLE_ITEM_X_0 = originalValue` within timeout. If we captured durability and it's > 0, apply durability directly to memory and block the restore write. If durability = 0, let it through (broken item needs visual update).
 
-4. **Timeout**: If restore doesn't arrive within 200ms, apply the blocked clear via the original SetBlock.
+4. **Timeout**: If restore doesn't arrive within 100ms, apply the blocked clear via the original SetBlock.
 
 ## Note to Server Developers
 

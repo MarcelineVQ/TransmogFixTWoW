@@ -57,7 +57,7 @@ static constexpr uint32_t VISIBLE_ITEM_STRIDE = 0x0C;         // 12 fields per e
 static constexpr uint32_t ITEM_FIELD_DURABILITY = 0x2E;       // Field 46 on item objects
 static constexpr uint32_t PLAYER_FIELD_INV_SLOT_HEAD = 0x1DA; // Field 474 - inventory slot GUIDs
 static constexpr uint32_t PLAYER_INV_SLOT_HEAD_BYTES = PLAYER_FIELD_INV_SLOT_HEAD * 4;  // 0x768
-static constexpr uint32_t COALESCE_TIMEOUT_MS = 200;
+static constexpr uint32_t COALESCE_TIMEOUT_MS = 100;
 
 static constexpr uint32_t ADDR_SetBlock = 0x6142E0;
 static constexpr uint32_t ADDR_RefreshVisualAppearance = 0x5fb880;
@@ -551,19 +551,32 @@ static void* __fastcall Hook_SetBlock(void* obj, void* edx, int index, void* val
     }
 
     // ==========================================================================
-    // INV_SLOT writes - detect real unequips and cancel pending blocks
+    // INV_SLOT writes - detect gear changes and update cache
     // ==========================================================================
     if (index >= (int)PLAYER_FIELD_INV_SLOT_HEAD &&
         index < (int)(PLAYER_FIELD_INV_SLOT_HEAD + 48)) {
         int offset = index - PLAYER_FIELD_INV_SLOT_HEAD;
         int invIndex = offset / 2;
         bool isLowWord = (offset % 2 == 0);
+        int equipSlot = invIndex - 5;  // INV_SLOT indices 5-23 map to equipment slots 0-18
 
-        // If this is a low word clear (GUID being cleared) for an equipment slot,
-        // and we have a pending VISIBLE_ITEM block, this is a REAL UNEQUIP - replay it now!
-        if (g_enabled && isLowWord && val == 0 && isLocalPlayerObject(obj)) {
-            int equipSlot = invIndex - 5;  // INV_SLOT indices 5-23 map to equipment slots 0-18
-            if (equipSlot >= 0 && equipSlot < 19 && g_localPending[equipSlot].active) {
+        if (g_enabled && isLocalPlayerObject(obj) && equipSlot >= 0 && equipSlot < 19) {
+            // Update cached equipped GUID when gear changes
+            if (g_cache.valid) {
+                if (isLowWord) {
+                    // Low 32 bits of GUID changing
+                    uint64_t currentGuid = g_cache.equippedGUIDs[equipSlot];
+                    g_cache.equippedGUIDs[equipSlot] = (currentGuid & 0xFFFFFFFF00000000ULL) | val;
+                } else {
+                    // High 32 bits of GUID changing
+                    uint64_t currentGuid = g_cache.equippedGUIDs[equipSlot];
+                    g_cache.equippedGUIDs[equipSlot] = (currentGuid & 0x00000000FFFFFFFFULL) | ((uint64_t)val << 32);
+                }
+            }
+
+            // If this is a low word clear (GUID being cleared),
+            // and we have a pending VISIBLE_ITEM block, this is a REAL UNEQUIP - replay it now!
+            if (isLowWord && val == 0 && g_localPending[equipSlot].active) {
                 // Replay the blocked VISIBLE_ITEM clear immediately
                 int fieldIndex = PLAYER_VISIBLE_ITEM_1_0 + (equipSlot * VISIBLE_ITEM_STRIDE);
                 if (p_OriginalSetBlock) {
