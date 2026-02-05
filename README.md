@@ -21,10 +21,11 @@ On death, `DurabilityLossAll()` does this for all 19 equipment slots. With a ful
 
 ## The Solution
 
-This fix uses two hooks at the field-write level:
+This fix uses three hooks:
 
-1. **SetBlock (0x6142E0)** - Intercepts all descriptor field writes
-2. **RefreshVisualAppearance (0x5fb880)** - Skips expensive visual refresh when coalesced
+1. **SetBlock** - Intercepts all descriptor field writes
+2. **RefreshVisualAppearance** - Skips expensive visual refresh when coalesced
+3. **SceneEnd** - Real-time timeout processing every frame
 
 When it detects the clear→durability→restore pattern within 100ms:
 
@@ -45,37 +46,8 @@ Most easily by adding `transmogfix.dll` to your `dlls.txt`file.
 
 ### Option 2: Embed in Another DLL
 
-If you're already building a mod DLL with your own hooking library, include the source files directly:
-
-```cpp
-#include "transmogCoalesce.h"
-
-// In DLL_PROCESS_ATTACH (after your hook library is initialized):
-if (transmogCoalesce_init() && transmogCoalesce_isHookOwner()) {
-    void* origSetBlock = nullptr;
-    void* origRefresh = nullptr;
-
-    // MinHook example:
-    // Hook 1: SetBlock (intercepts all field writes)
-    MH_CreateHook(transmogCoalesce_getSetBlockTarget(),
-                  transmogCoalesce_getSetBlockHook(), &origSetBlock);
-
-    // Hook 2: RefreshVisualAppearance (skips expensive refresh)
-    MH_CreateHook(transmogCoalesce_getRefreshTarget(),
-                  transmogCoalesce_getRefreshHook(), &origRefresh);
-
-    // Set trampolines BEFORE enabling
-    transmogCoalesce_setSetBlockOriginal(origSetBlock);
-    transmogCoalesce_setRefreshOriginal(origRefresh);
-
-    MH_EnableHook(MH_ALL_HOOKS);
-}
-
-// In DLL_PROCESS_DETACH:
-transmogCoalesce_cleanup();
-```
-
-The module uses a per-process mutex (`Local\TransmogCoalesceHook_<pid>`) for multi-DLL safety within the same process. If another DLL in the same process already has the hook installed, `transmogCoalesce_isHookOwner()` returns false and you should skip hook installation. Multiple game clients (multiboxing) each get their own hook.
+If you're already building a mod DLL with your own hooking library, include the source files directly.  
+See `transmogCoalesce.h` for complete API reference and usage examples (MinHook and HadesMem).  
 
 ## Building
 
@@ -89,31 +61,7 @@ make release      # Optimized & stripped (291K)
 make lib          # Static library for embedding
 make clean        # Clean artifacts
 ```
-
 The Makefile automatically fetches the MinHook submodule if needed.
-
-## API Reference
-
-```cpp
-// Initialization
-bool transmogCoalesce_init();           // Call first, returns false on failure
-void transmogCoalesce_cleanup();        // Call on unload
-bool transmogCoalesce_isHookOwner();    // True if this DLL should install hooks
-
-// Hook 1: SetBlock (0x6142E0) - intercepts all field writes
-void* transmogCoalesce_getSetBlockTarget();
-void* transmogCoalesce_getSetBlockHook();
-void  transmogCoalesce_setSetBlockOriginal(void* trampoline);
-
-// Hook 2: RefreshVisualAppearance (0x5fb880) - skips expensive visual refresh
-void* transmogCoalesce_getRefreshTarget();
-void* transmogCoalesce_getRefreshHook();
-void  transmogCoalesce_setRefreshOriginal(void* trampoline);
-
-// Runtime control
-void transmogCoalesce_setEnabled(bool enabled);
-bool transmogCoalesce_isEnabled();
-```
 
 ## How It Works
 
@@ -125,7 +73,7 @@ The fix identifies the transmog durability pattern by intercepting field writes 
 
 3. **Restore detected**: SetBlock called with `PLAYER_VISIBLE_ITEM_X_0 = originalValue` within timeout. If we captured durability and it's > 0, apply durability directly to memory and block the restore write. If durability = 0, let it through (broken item needs visual update).
 
-4. **Timeout**: If restore doesn't arrive within 100ms, apply the blocked clear via the original SetBlock.
+4. **Timeout**: If restore doesn't arrive within 100ms, apply the blocked clear via the original SetBlock. Timeouts are checked every frame via the SceneEnd hook for real-time responsiveness.
 
 ## Note to Server Developers
 

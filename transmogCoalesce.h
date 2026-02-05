@@ -34,15 +34,21 @@
 //       void* origSetBlock = nullptr;
 //       MH_CreateHook(transmogCoalesce_getSetBlockTarget(),
 //                     transmogCoalesce_getSetBlockHook(), &origSetBlock);
-//       MH_EnableHook(transmogCoalesce_getSetBlockTarget());
 //       transmogCoalesce_setSetBlockOriginal(origSetBlock);
 //
 //       // Hook 2: RefreshVisualAppearance (skips expensive visual refresh)
 //       void* origRefresh = nullptr;
 //       MH_CreateHook(transmogCoalesce_getRefreshTarget(),
 //                     transmogCoalesce_getRefreshHook(), &origRefresh);
-//       MH_EnableHook(transmogCoalesce_getRefreshTarget());
 //       transmogCoalesce_setRefreshOriginal(origRefresh);
+//
+//       // Hook 3: SceneEnd (real-time timeout processing)
+//       void* origSceneEnd = nullptr;
+//       MH_CreateHook(transmogCoalesce_getFrameUpdateTarget(),
+//                     transmogCoalesce_getFrameUpdateHook(), &origSceneEnd);
+//       transmogCoalesce_setFrameUpdateOriginal(origSceneEnd);
+//
+//       MH_EnableHook(MH_ALL_HOOKS);
 //   }
 //
 //   // In DLL_PROCESS_DETACH:
@@ -55,6 +61,7 @@
 //
 //   std::unique_ptr<hadesmem::PatchDetour<SetBlockT>> g_setBlockHook;
 //   std::unique_ptr<hadesmem::PatchDetour<RefreshT>> g_refreshHook;
+//   std::unique_ptr<hadesmem::PatchDetour<SceneEndT>> g_sceneEndHook;
 //
 //   // In DLL_PROCESS_ATTACH:
 //   if (transmogCoalesce_init() && transmogCoalesce_isHookOwner()) {
@@ -79,11 +86,22 @@
 //           process, refreshTarget, refreshHook);
 //       g_refreshHook->Apply();
 //       transmogCoalesce_setRefreshOriginal(g_refreshHook->GetTrampoline());
+//
+//       // Hook 3: SceneEnd
+//       auto sceneEndTarget = reinterpret_cast<SceneEndT>(
+//           transmogCoalesce_getFrameUpdateTarget());
+//       auto sceneEndHook = reinterpret_cast<SceneEndT>(
+//           transmogCoalesce_getFrameUpdateHook());
+//       g_sceneEndHook = std::make_unique<hadesmem::PatchDetour<SceneEndT>>(
+//           process, sceneEndTarget, sceneEndHook);
+//       g_sceneEndHook->Apply();
+//       transmogCoalesce_setFrameUpdateOriginal(g_sceneEndHook->GetTrampoline());
 //   }
 //
 //   // In DLL_PROCESS_DETACH:
 //   g_setBlockHook.reset();
 //   g_refreshHook.reset();
+//   g_sceneEndHook.reset();
 //   transmogCoalesce_cleanup();
 //
 // DEPENDENCIES:
@@ -167,6 +185,11 @@ void  transmogCoalesce_setSetBlockOriginal(void* original);
 void* transmogCoalesce_getRefreshTarget();
 void* transmogCoalesce_getRefreshHook();
 void  transmogCoalesce_setRefreshOriginal(void* original);
+
+// Hook 3: SceneEnd (0x5a17a0) - real-time timeout processing every frame
+void* transmogCoalesce_getFrameUpdateTarget();
+void* transmogCoalesce_getFrameUpdateHook();
+void  transmogCoalesce_setFrameUpdateOriginal(void* original);
 
 // Hook ownership
 bool  transmogCoalesce_isHookOwner();

@@ -38,6 +38,11 @@ static RefreshAppearance_t p_RefreshAppearance = reinterpret_cast<RefreshAppeara
 typedef void(__fastcall* RefreshEquipmentDisplay_t)(void*);
 static RefreshEquipmentDisplay_t p_RefreshEquipmentDisplay = reinterpret_cast<RefreshEquipmentDisplay_t>(0x60ABE0);
 
+// CGxDevice::SceneEnd @ 0x5a17a0 - called every frame after rendering
+// __thiscall: this (CGxDevice) in ECX, no other params
+typedef void(__thiscall* SceneEnd_t)(void* gxDevice);
+static SceneEnd_t p_OriginalSceneEnd = nullptr;
+
 // Global CreatureDisplayInfo table pointer at 0x00c0de90
 // Access: (*PTR_00c0de90)[displayId] -> ModelData*
 static uint32_t*** g_displayInfoTablePtr = reinterpret_cast<uint32_t***>(0x00c0de90);
@@ -57,10 +62,11 @@ static constexpr uint32_t VISIBLE_ITEM_STRIDE = 0x0C;         // 12 fields per e
 static constexpr uint32_t ITEM_FIELD_DURABILITY = 0x2E;       // Field 46 on item objects
 static constexpr uint32_t PLAYER_FIELD_INV_SLOT_HEAD = 0x1DA; // Field 474 - inventory slot GUIDs
 static constexpr uint32_t PLAYER_INV_SLOT_HEAD_BYTES = PLAYER_FIELD_INV_SLOT_HEAD * 4;  // 0x768
-static constexpr uint32_t COALESCE_TIMEOUT_MS = 100;
+static constexpr uint32_t COALESCE_TIMEOUT_MS = 200;
 
 static constexpr uint32_t ADDR_SetBlock = 0x6142E0;
 static constexpr uint32_t ADDR_RefreshVisualAppearance = 0x5fb880;
+static constexpr uint32_t ADDR_SceneEnd = 0x5a17a0;
 
 // =============================================================================
 // State
@@ -348,9 +354,12 @@ static void processTimeouts(uint32_t now) {
         };
         UnitSlots unitsToUpdate[16] = {};
         int unitCount = 0;
+        int activeCount = g_otherPendingCount;  // Capture count for early exit
+        int foundCount = 0;
 
-        for (int i = 0; i < OTHER_PENDING_SIZE; i++) {
+        for (int i = 0; i < OTHER_PENDING_SIZE && foundCount < activeCount; i++) {
             if (g_otherPending[i].active) {
+                foundCount++;  // Count active entries for early exit
                 uint32_t elapsed = now - g_otherPending[i].timestamp;
                 if (elapsed >= COALESCE_TIMEOUT_MS) {
                     // Replay the blocked clear via SetBlock
@@ -440,7 +449,15 @@ static void* __fastcall Hook_SetBlock(void* obj, void* edx, int index, void* val
             if (g_enabled && isLocalPlayerObject(obj)) {
                 // =========== LOCAL PLAYER ===========
                 if (val == 0 && g_cachedVisibleItem[slot] != 0) {
-                    // CLEAR detected - start transmog pattern tracking
+                    // CLEAR detected - but check if INV_SLOT is already empty (real unequip)
+                    // If INV_SLOT is empty, the item is already gone - don't block
+                    if (g_cache.valid && g_cache.equippedGUIDs[slot] == 0) {
+                        // Real unequip - INV_SLOT already cleared, let the VISIBLE_ITEM clear through
+                        g_cachedVisibleItem[slot] = 0;
+                        goto passthrough;
+                    }
+
+                    // Start transmog pattern tracking
                     if (!g_localPending[slot].active) g_localPendingCount++;
                     g_localPending[slot].originalVisibleItem = g_cachedVisibleItem[slot];
                     g_localPending[slot].timestamp = now;
@@ -593,11 +610,6 @@ static void* __fastcall Hook_SetBlock(void* obj, void* edx, int index, void* val
     }
 
 passthrough:
-    // Process timeouts periodically (only when we have pending entries)
-    if (g_localPendingCount > 0 || g_otherPendingCount > 0) {
-        processTimeouts(GetTickCount());
-    }
-
     // Call original for all non-blocked writes
     if (p_OriginalSetBlock) {
         return p_OriginalSetBlock(obj, index, value);
@@ -714,6 +726,30 @@ static void __fastcall Hook_RefreshVisualAppearance(
 }
 
 // =============================================================================
+// Hook 3: SceneEnd (0x5a17a0) - real-time timeout processing every frame
+// =============================================================================
+// __thiscall: ECX = this (CGxDevice), no other params
+// We use __fastcall with dummy EDX to capture ECX properly in MinHook
+
+static void __fastcall Hook_SceneEnd(void* gxDevice, void* edx) {
+    (void)edx;
+
+    // Process pending timeouts every frame for real-time responsiveness
+    if (g_enabled && (g_localPendingCount > 0 || g_otherPendingCount > 0)) {
+        // Ensure cache is valid for local player timeout processing
+        if (g_localPendingCount > 0 && !g_cache.valid) {
+            cachePlayerState();
+        }
+        processTimeouts(GetTickCount());
+    }
+
+    // Call original scene end
+    if (p_OriginalSceneEnd) {
+        p_OriginalSceneEnd(gxDevice);
+    }
+}
+
+// =============================================================================
 // Public API
 // =============================================================================
 
@@ -741,6 +777,19 @@ void* transmogCoalesce_getRefreshHook() {
 
 void transmogCoalesce_setRefreshOriginal(void* original) {
     p_OriginalRefresh = reinterpret_cast<RefreshVisualAppearance_t>(original);
+}
+
+// Hook 3: SceneEnd
+void* transmogCoalesce_getFrameUpdateTarget() {
+    return reinterpret_cast<void*>(ADDR_SceneEnd);
+}
+
+void* transmogCoalesce_getFrameUpdateHook() {
+    return reinterpret_cast<void*>(&Hook_SceneEnd);
+}
+
+void transmogCoalesce_setFrameUpdateOriginal(void* original) {
+    p_OriginalSceneEnd = reinterpret_cast<SceneEnd_t>(original);
 }
 
 bool transmogCoalesce_init() {
