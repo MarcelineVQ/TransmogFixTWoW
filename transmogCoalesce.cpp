@@ -136,21 +136,28 @@ struct CachedPlayerState {
 };
 static CachedPlayerState g_cache = {};
 
-// Call once at start of hook to cache all player state
+// Validate and refresh cache. Re-caches when the player object pointer changes
+// (zone change, instance entry, relog) since the GUID survives but the pointer doesn't.
 static bool cachePlayerState() {
-    g_cache.valid = false;
-    g_cache.localGUID = p_UnitGUID("player");
-    if (g_cache.localGUID == 0) return false;
+    uint64_t localGUID = p_UnitGUID("player");
+    if (localGUID == 0) { g_cache.valid = false; return false; }
 
-    g_cache.playerObj = p_GetObjectByGUID(
-        (uint32_t)(g_cache.localGUID & 0xFFFFFFFF),
-        (uint32_t)(g_cache.localGUID >> 32));
-    if (!g_cache.playerObj || (g_cache.playerObj & 1)) return false;
+    uint32_t playerObj = p_GetObjectByGUID(
+        (uint32_t)(localGUID & 0xFFFFFFFF),
+        (uint32_t)(localGUID >> 32));
+    if (!playerObj || (playerObj & 1)) { g_cache.valid = false; return false; }
+
+    // Fast path: player object hasn't changed, cache is still valid
+    if (g_cache.valid && g_cache.playerObj == playerObj) return true;
+
+    // Player object changed (zone change, instance entry, etc.) - refresh everything
+    g_cache.valid = false;
+    g_cache.localGUID = localGUID;
+    g_cache.playerObj = playerObj;
 
     g_cache.playerDesc = *reinterpret_cast<uint32_t*>(g_cache.playerObj + 0x8);
     if (!g_cache.playerDesc || (g_cache.playerDesc & 1)) return false;
 
-    // Cache all 19 equipped item GUIDs and current VISIBLE_ITEM values
     for (int slot = 0; slot < 19; slot++) {
         int adjustedSlot = slot + 5;
         g_cache.equippedGUIDs[slot] = *reinterpret_cast<uint64_t*>(
@@ -160,11 +167,9 @@ static bool cachePlayerState() {
         g_cache.visibleItems[slot] = *reinterpret_cast<uint32_t*>(
             g_cache.playerDesc + fieldIndex * 4);
 
-        // Sync to SetBlock cache if not already populated
-        // (initial creation may bypass SetBlock, leaving g_cachedVisibleItem as 0)
-        if (g_cachedVisibleItem[slot] == 0 && g_cache.visibleItems[slot] != 0) {
-            g_cachedVisibleItem[slot] = g_cache.visibleItems[slot];
-        }
+        // Unconditionally sync: create object may bypass SetBlock,
+        // and after zone change the old cached values are stale
+        g_cachedVisibleItem[slot] = g_cache.visibleItems[slot];
     }
 
     g_cache.valid = true;
@@ -262,21 +267,34 @@ static void readVisibleItems(void* unit, uint32_t* outItems) {
     }
 }
 
-// Check if an object is the local player (for SetBlock)
+// Check if an object is the local player (GUID comparison - survives zone changes)
 static bool isLocalPlayerObject(void* obj) {
-    if (!g_cache.valid) return false;
-    return (uint32_t)(uintptr_t)obj == g_cache.playerObj;
+    uint64_t localGUID = p_UnitGUID("player");
+    if (localGUID == 0) return false;
+    return getUnitGuid(obj) == localGUID;
 }
 
-// Find which slot an item object belongs to (for SetBlock durability capture)
+// Find which slot an item object belongs to (fresh lookup from object manager)
 static int findSlotForItemObject(void* obj) {
-    if (!g_cache.valid) return -1;
+    // Get the current player descriptor fresh - not from cache, since equipped
+    // GUIDs may be stale after zone change even if cachePlayerState hasn't re-run yet
+    uint64_t localGUID = p_UnitGUID("player");
+    if (localGUID == 0) return -1;
+    uint32_t playerObj = p_GetObjectByGUID(
+        (uint32_t)(localGUID & 0xFFFFFFFF), (uint32_t)(localGUID >> 32));
+    if (!playerObj || (playerObj & 1)) return -1;
+    uint32_t playerDesc = *reinterpret_cast<uint32_t*>(playerObj + 0x8);
+    if (!playerDesc || (playerDesc & 1)) return -1;
+
     uint32_t objAddr = (uint32_t)(uintptr_t)obj;
     for (int slot = 0; slot < 19; slot++) {
-        uint32_t equipped = getCachedEquippedItemObject(slot);
-        if (equipped == objAddr) {
-            return slot;
-        }
+        int adjustedSlot = slot + 5;
+        uint64_t equippedGUID = *reinterpret_cast<uint64_t*>(
+            playerDesc + PLAYER_INV_SLOT_HEAD_BYTES + adjustedSlot * 8);
+        if (equippedGUID == 0) continue;
+        uint32_t equipped = p_GetObjectByGUID(
+            (uint32_t)(equippedGUID & 0xFFFFFFFF), (uint32_t)(equippedGUID >> 32));
+        if (equipped == objAddr) return slot;
     }
     return -1;
 }
@@ -449,13 +467,16 @@ static void* __fastcall Hook_SetBlock(void* obj, void* edx, int index, void* val
         if (offset % VISIBLE_ITEM_STRIDE == 0) {  // First field of slot (item entry)
             int slot = offset / VISIBLE_ITEM_STRIDE;
 
-            // Cache player state if not done yet
             if (!g_cache.valid) cachePlayerState();
 
             uint32_t now = GetTickCount();
 
             if (g_enabled && isLocalPlayerObject(obj)) {
                 // =========== LOCAL PLAYER ===========
+                // Detect stale cache: local player at a new address means zone change
+                if (!g_cache.valid || g_cache.playerObj != (uint32_t)(uintptr_t)obj) {
+                    cachePlayerState();
+                }
                 if (val == 0 && g_cachedVisibleItem[slot] != 0) {
                     // CLEAR detected - but check if INV_SLOT is already empty (real unequip)
                     // If INV_SLOT is empty, the item is already gone - don't block
