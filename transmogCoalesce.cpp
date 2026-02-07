@@ -62,7 +62,14 @@ static constexpr uint32_t VISIBLE_ITEM_STRIDE = 0x0C;         // 12 fields per e
 static constexpr uint32_t ITEM_FIELD_DURABILITY = 0x2E;       // Field 46 on item objects
 static constexpr uint32_t PLAYER_FIELD_INV_SLOT_HEAD = 0x1DA; // Field 474 - inventory slot GUIDs
 static constexpr uint32_t PLAYER_INV_SLOT_HEAD_BYTES = PLAYER_FIELD_INV_SLOT_HEAD * 4;  // 0x768
-static constexpr uint32_t COALESCE_TIMEOUT_MS = 200;
+// Timeout only used for OTHER players (we don't have their INV_SLOT info)
+// Local player uses INV_SLOT changes as authoritative signal instead
+static constexpr uint32_t OTHER_PLAYER_TIMEOUT_MS = 100;
+
+// Safety-net cleanup for local player - cancels stuck pending state after inactivity
+// This is NOT for pattern detection (INV_SLOT handles that), just defensively preventing stuck state
+// Timer resets on any activity (clear, durability capture, restore attempt)
+static constexpr uint32_t LOCAL_PLAYER_CLEANUP_MS = 5000;  // 5 seconds of inactivity
 
 static constexpr uint32_t ADDR_SetBlock = 0x6142E0;
 static constexpr uint32_t ADDR_RefreshVisualAppearance = 0x5fb880;
@@ -152,6 +159,12 @@ static bool cachePlayerState() {
         int fieldIndex = PLAYER_VISIBLE_ITEM_1_0 + (slot * VISIBLE_ITEM_STRIDE);
         g_cache.visibleItems[slot] = *reinterpret_cast<uint32_t*>(
             g_cache.playerDesc + fieldIndex * 4);
+
+        // Sync to SetBlock cache if not already populated
+        // (initial creation may bypass SetBlock, leaving g_cachedVisibleItem as 0)
+        if (g_cachedVisibleItem[slot] == 0 && g_cache.visibleItems[slot] != 0) {
+            g_cachedVisibleItem[slot] = g_cache.visibleItems[slot];
+        }
     }
 
     g_cache.valid = true;
@@ -322,20 +335,15 @@ static int findOtherPendingEntry(uint64_t guid, int slot) {
 // =============================================================================
 
 static void processTimeouts(uint32_t now) {
-    // Local player timeouts - replay the blocked clear via SetBlock
-    if (g_localPendingCount > 0 && g_cache.valid && p_OriginalSetBlock) {
-        void* playerObj = (void*)(uintptr_t)g_cache.playerObj;
+    // LOCAL PLAYER: Safety-net cleanup for stuck pending state
+    // This is NOT for pattern detection (INV_SLOT handles real unequips).
+    // Only triggers after extended inactivity - silently cancels to prevent stuck state.
+    if (g_localPendingCount > 0) {
         for (int slot = 0; slot < 19; slot++) {
             if (g_localPending[slot].active) {
                 uint32_t elapsed = now - g_localPending[slot].timestamp;
-                if (elapsed >= COALESCE_TIMEOUT_MS) {
-                    // Replay the blocked clear via SetBlock
-                    int fieldIndex = PLAYER_VISIBLE_ITEM_1_0 + (slot * VISIBLE_ITEM_STRIDE);
-                    p_OriginalSetBlock(playerObj, fieldIndex, (void*)0);
-
-                    // Update our cache
-                    g_cachedVisibleItem[slot] = 0;
-
+                if (elapsed >= LOCAL_PLAYER_CLEANUP_MS) {
+                    // Stale pending state - silently cancel (no visual change)
                     g_localPending[slot].active = false;
                     g_localPending[slot].hasDurability = false;
                     g_localPendingCount--;
@@ -344,7 +352,7 @@ static void processTimeouts(uint32_t now) {
         }
     }
 
-    // Other player timeouts - replay the blocked clear via SetBlock, then force visual update
+    // OTHER PLAYERS: Use timeout since we don't have their INV_SLOT info
     if (g_otherPendingCount > 0 && p_OriginalSetBlock) {
         // Track units and their expired slots
         struct UnitSlots {
@@ -361,7 +369,7 @@ static void processTimeouts(uint32_t now) {
             if (g_otherPending[i].active) {
                 foundCount++;  // Count active entries for early exit
                 uint32_t elapsed = now - g_otherPending[i].timestamp;
-                if (elapsed >= COALESCE_TIMEOUT_MS) {
+                if (elapsed >= OTHER_PLAYER_TIMEOUT_MS) {
                     // Replay the blocked clear via SetBlock
                     if (g_otherPending[i].unitPtr && p_OriginalSetBlock) {
                         int fieldIndex = PLAYER_VISIBLE_ITEM_1_0 + (g_otherPending[i].slot * VISIBLE_ITEM_STRIDE);
@@ -467,9 +475,12 @@ static void* __fastcall Hook_SetBlock(void* obj, void* edx, int index, void* val
                     return (void*)1;
                 }
                 else if (val != 0 && g_localPending[slot].active) {
-                    uint32_t elapsed = now - g_localPending[slot].timestamp;
-                    if (elapsed < COALESCE_TIMEOUT_MS && val == g_localPending[slot].originalVisibleItem) {
-                        // RESTORE detected within timeout - transmog pattern confirmed!
+                    // LOCAL PLAYER: No timeout needed - we use INV_SLOT as authoritative signal
+                    // If INV_SLOT clears, the pending state is already cancelled (see INV_SLOT handler below)
+                    // So if we're still pending here, the item is still equipped
+
+                    if (val == g_localPending[slot].originalVisibleItem) {
+                        // RESTORE with same value - transmog pattern confirmed!
 
                         // Apply captured durability if we have it
                         if (g_localPending[slot].hasDurability) {
@@ -495,7 +506,7 @@ static void* __fastcall Hook_SetBlock(void* obj, void* edx, int index, void* val
                         return (void*)1;
                     }
                     else {
-                        // Timeout or different item - real gear change
+                        // Different item value - real gear change, cancel pending and allow
                         g_localPending[slot].active = false;
                         g_localPending[slot].hasDurability = false;
                         g_localPendingCount--;
@@ -536,7 +547,7 @@ static void* __fastcall Hook_SetBlock(void* obj, void* edx, int index, void* val
                         // Restore - check if within timeout AND same item
                         uint32_t elapsed = now - g_otherPending[idx].timestamp;
                         uint32_t currentVal = readUnitVisibleItem(obj, slot);  // Still has original (we blocked clear)
-                        if (elapsed < COALESCE_TIMEOUT_MS && val == currentVal) {
+                        if (elapsed < OTHER_PLAYER_TIMEOUT_MS && val == currentVal) {
                             // Same item restored - transmog pattern confirmed
                             g_otherPending[idx].active = false;
                             g_otherPendingCount--;
@@ -563,6 +574,7 @@ static void* __fastcall Hook_SetBlock(void* obj, void* edx, int index, void* val
             // This is durability update for a pending slot - capture it
             g_localPending[slot].capturedDurability = val;
             g_localPending[slot].hasDurability = true;
+            g_localPending[slot].timestamp = GetTickCount();  // Reset cleanup timer (activity)
             return (void*)1;  // Return success without writing
         }
     }
@@ -639,6 +651,18 @@ static void __fastcall Hook_RefreshVisualAppearance(
         return;
     }
 
+    // LOCAL PLAYER: If we have pending SetBlock blocks, the descriptor hasn't changed.
+    // The packet handler calls RefreshVisualAppearance anyway, but there's nothing to refresh.
+    if (g_cache.valid && guid == g_cache.localGUID && g_localPendingCount > 0) {
+        // Cheap cache update + UI flags only
+        if (p_RefreshAppearance) {
+            p_RefreshAppearance(unit);
+        }
+        *(uint32_t*)((char*)unit + 0xccc) = 1;
+        *(uint32_t*)((char*)unit + 0xcd0) = 1;
+        return;
+    }
+
     uint32_t now = GetTickCount();
 
     // Read current VISIBLE_ITEM values
@@ -668,7 +692,7 @@ static void __fastcall Hook_RefreshVisualAppearance(
             else if (current != 0 && cached == 0 && state->clearTimestamp[slot] != 0) {
                 // RESTORE detected
                 uint32_t elapsed = now - state->clearTimestamp[slot];
-                if (elapsed < COALESCE_TIMEOUT_MS) {
+                if (elapsed < OTHER_PLAYER_TIMEOUT_MS) {
                     restoredSlots++;
                 } else {
                     allRestoresWithinTimeout = false;
@@ -695,7 +719,7 @@ static void __fastcall Hook_RefreshVisualAppearance(
     for (int slot = 0; slot < 19; slot++) {
         if (state->clearTimestamp[slot] != 0) {
             uint32_t elapsed = now - state->clearTimestamp[slot];
-            if (elapsed >= COALESCE_TIMEOUT_MS) {
+            if (elapsed >= OTHER_PLAYER_TIMEOUT_MS) {
                 state->clearTimestamp[slot] = 0;  // Timed out
             } else {
                 state->hasPendingClear = true;
@@ -734,12 +758,10 @@ static void __fastcall Hook_RefreshVisualAppearance(
 static void __fastcall Hook_SceneEnd(void* gxDevice, void* edx) {
     (void)edx;
 
-    // Process pending timeouts every frame for real-time responsiveness
+    // Process pending timeouts every frame
+    // - Other players: pattern detection timeout (100ms)
+    // - Local player: safety-net cleanup only (5s inactivity)
     if (g_enabled && (g_localPendingCount > 0 || g_otherPendingCount > 0)) {
-        // Ensure cache is valid for local player timeout processing
-        if (g_localPendingCount > 0 && !g_cache.valid) {
-            cachePlayerState();
-        }
         processTimeouts(GetTickCount());
     }
 
