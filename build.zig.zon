@@ -1,0 +1,15 @@
+.{
+    .name = .transmogfix,
+    .version = "0.1.0",
+    .fingerprint = 0x2b7b853076f67bae,
+    .dependencies = .{
+        .hook = .{
+            .path = "libs/hook",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}

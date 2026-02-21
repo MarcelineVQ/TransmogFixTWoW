@@ -1,0 +1,10 @@
+.{
+    .name = .hook,
+    .version = "0.1.0",
+    .fingerprint = 0xa4584355bc807307,
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}
