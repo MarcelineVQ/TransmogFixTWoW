@@ -414,10 +414,18 @@ fn findOtherPendingEntry(guid: u64, slot: i32) i32 {
 // =============================================================================
 
 fn callOriginalSetBlock(obj: u32, index: u32, value: u32) u32 {
+    // Save/restore ECX around the call: the callee overwrites ECX internally
+    // (SetBlock does `mov ecx, [ebp+0xC]`), but we can't list ECX as a clobber
+    // since it's already an input constraint. Without the save/restore, the
+    // compiler may reuse the now-stale ECX for `obj` on a subsequent call.
+    // The trampoline's `ret 8` cleans up the pushed index+value, leaving our
+    // saved ECX on top for the pop.
     return asm volatile (
+        \\push %%ecx
         \\push %[value]
         \\push %[index]
         \\call *%[func]
+        \\pop %%ecx
         : [ret] "={eax}" (-> u32),
         : [_] "{ecx}" (obj),
           [index] "r" (index),
@@ -494,23 +502,25 @@ fn processTimeouts(now: u32) void {
                 found_count += 1;
                 const elapsed = now -% g_other_pending[i].timestamp;
                 if (elapsed >= OTHER_PLAYER_TIMEOUT_MS) {
-                    conFmt("[other] TIMEOUT slot={d:2} guid=0x{X:0>16} {d}ms -- replaying clear\n", .{ g_other_pending[i].slot, g_other_pending[i].guid, elapsed });
-                    // Replay the blocked clear via SetBlock
-                    if (g_other_pending[i].unit_ptr != 0) {
+                    // Re-resolve the GUID to a live object pointer — the cached
+                    // unit_ptr may be stale if the player despawned since capture.
+                    const unit = getObjectByGUID(g_other_pending[i].guid);
+                    conFmt("[other] TIMEOUT slot={d:2} guid=0x{X:0>16} {d}ms unit=0x{X:0>8}\n", .{ g_other_pending[i].slot, g_other_pending[i].guid, elapsed, unit });
+                    if (unit != 0 and (unit & 1) == 0) {
                         const field_index = PLAYER_VISIBLE_ITEM_1_0 + (@as(u32, @intCast(g_other_pending[i].slot)) * VISIBLE_ITEM_STRIDE);
-                        _ = callOriginalSetBlock(g_other_pending[i].unit_ptr, field_index, 0);
+                        _ = callOriginalSetBlock(unit, field_index, 0);
 
                         // Track unit for visual update
                         var unit_idx: i32 = -1;
                         for (0..unit_count) |j| {
-                            if (units_to_update[j].unit == g_other_pending[i].unit_ptr) {
+                            if (units_to_update[j].unit == unit) {
                                 unit_idx = @intCast(j);
                                 break;
                             }
                         }
                         if (unit_idx < 0 and unit_count < 16) {
                             unit_idx = @intCast(unit_count);
-                            units_to_update[unit_count].unit = g_other_pending[i].unit_ptr;
+                            units_to_update[unit_count].unit = unit;
                             units_to_update[unit_count].slot_count = 0;
                             unit_count += 1;
                         }
